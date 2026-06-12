@@ -1,0 +1,9 @@
+{
+  "name": "conversation-archiver",
+  "version": "0.1.0",
+  "description": "Archive each Claude Code conversation turn (your input + Claude's text reply, excluding tool calls) to a per-session markdown file in a git repo, organized by month. Supports an auto mode (commit + push every turn) and a manual mode (commit + push on /conversation-archiver:upload).",
+  "author": {
+    "name": "Paul",
+    "email": "paul@mainfunc.ai"
+  }
+}

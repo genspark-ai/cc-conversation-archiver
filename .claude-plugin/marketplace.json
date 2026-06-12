@@ -1,0 +1,15 @@
+{
+  "name": "cc-conversation-archiver",
+  "owner": {
+    "name": "Paul",
+    "email": "paul@mainfunc.ai"
+  },
+  "plugins": [
+    {
+      "name": "conversation-archiver",
+      "source": "./plugins/conversation-archiver",
+      "description": "Archive each Claude Code conversation turn (your input + Claude's text reply, no tool calls) to a per-session markdown file in a git repo, organized by month. Auto or manual commit/push modes.",
+      "category": "productivity"
+    }
+  ]
+}
