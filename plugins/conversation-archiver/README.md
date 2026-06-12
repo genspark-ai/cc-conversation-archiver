@@ -93,6 +93,7 @@ them automatically):
 | `/conversation-archiver:auto` | **AUTO** — each turn writes the file, then `git commit` + `git push` (push runs in the background). Default. |
 | `/conversation-archiver:manual` | **MANUAL** — each turn writes the file locally only; no commit/push. |
 | `/conversation-archiver:upload` | Commit + push the whole archive now (use in manual mode). |
+| `/conversation-archiver:backfill` | Archive every existing Claude Code transcript on disk — the sessions that ran **before** the plugin was installed (the hooks never saw them) — then commit + push once. Idempotent: re-running only adds new turns. |
 | `/conversation-archiver:status` | Show current mode, repo path, remote, and recent commits. |
 | `/conversation-archiver:connect <sb-connect link>` | Connect to your **Second Brain** — see below. |
 

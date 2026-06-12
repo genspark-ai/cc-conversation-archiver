@@ -567,6 +567,125 @@ def do_upload() -> None:
         print(f"pushed ({repo})")
 
 
+def claude_projects_dir() -> Path:
+    """Where Claude Code stores per-session transcript JSONL files. Layout is
+    ``<projects>/<encoded-project>/<session-id>.jsonl``. Overridable via
+    CLAUDE_PROJECTS_DIR (mainly for tests)."""
+    env = os.environ.get("CLAUDE_PROJECTS_DIR")
+    return Path(env).expanduser() if env else HOME / ".claude" / "projects"
+
+
+def transcript_session_id(tpath: Path) -> str | None:
+    """Session id for a transcript: the ``sessionId`` field if present, else the
+    filename stem (Claude Code names each transcript ``<session-id>.jsonl``)."""
+    try:
+        with tpath.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(entry, dict):
+                    sid = entry.get("sessionId") or entry.get("session_id")
+                    if sid:
+                        return str(sid)
+                break  # only the first non-blank line carries the id
+    except OSError:
+        return None
+    return tpath.stem or None
+
+
+def transcript_has_content(tpath: Path) -> bool:
+    """True if the transcript yields at least one archivable block (user /
+    assistant / compact), so empty or tool-only sessions are skipped."""
+    for _ in parse_transcript(tpath):
+        return True
+    return False
+
+
+def do_backfill() -> None:
+    """Backfill (``archive.py --backfill``): archive every existing Claude Code
+    transcript on disk — the sessions that ran *before* the plugin was installed,
+    which the hooks never saw. Reuses the normal per-session archiving logic, so
+    it is fully idempotent (re-running only adds new turns and never forks a
+    file). Writes the whole sweep under one archive lock, then commits + pushes
+    ONCE (not per session). Prints a one-line summary for the command to relay."""
+    cfg = load_config()
+    repo = get_repo(cfg)
+    projects = claude_projects_dir()
+    if not projects.is_dir():
+        print(f"no Claude Code transcripts dir at {projects} — nothing to backfill")
+        return
+    # Top-level session transcripts only: <projects>/<encoded-cwd>/<sid>.jsonl.
+    # Deeper files (e.g. <…>/<sid>/subagents/agent-*.jsonl) are sub-agent / Task
+    # transcripts, not user conversations, and are deliberately excluded.
+    transcripts = sorted(projects.glob("*/*.jsonl"))
+    if not transcripts:
+        print(f"no transcripts found under {projects} — nothing to backfill")
+        return
+
+    ensure_repo(repo)
+    archived = skipped = 0
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    with open(ARCHIVE_LOCK, "w") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        for tpath in transcripts:
+            sid = transcript_session_id(tpath)
+            if not sid or not transcript_has_content(tpath):
+                skipped += 1
+                continue
+            try:
+                # do_commit=False: write files only; we commit the whole sweep
+                # once below instead of once per (potentially hundreds of) session.
+                _archive_locked(sid, tpath, "backfill", do_commit=False)
+                archived += 1
+            except Exception as exc:  # one bad transcript must not abort the sweep
+                log(f"backfill {tpath.name} failed: {exc}")
+                skipped += 1
+            if archived and archived % 25 == 0:
+                print(f"  … {archived} sessions archived")
+        # One commit for the whole backfill. Track the three outcomes
+        # separately — a clean tree and a *failed* commit must not look alike.
+        run_git(repo, "add", "-A")
+        had_changes = bool(run_git(repo, "status", "--porcelain").stdout.strip())
+        committed = False
+        commit_err = ""
+        if had_changes:
+            msg = f"backfill {archived} session(s): " + \
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            commit = run_git(repo, "commit", "-m", msg)
+            committed = commit.returncode == 0
+            if not committed:
+                commit_err = ((commit.stderr or "") + (commit.stdout or "")).strip()
+                log(f"backfill commit failed: {commit_err}")
+
+    log(f"[backfill] archived={archived} skipped={skipped} "
+        f"transcripts={len(transcripts)}")
+    print(f"backfilled {archived} session(s) "
+          f"(skipped {skipped} empty/unreadable of {len(transcripts)} transcripts)")
+
+    # A failed commit (staged changes that wouldn't commit) is fatal — surface it
+    # rather than pushing a half-done state.
+    if had_changes and not committed:
+        print(f"commit failed ({repo}): {commit_err[:200] or 'see archive.log'} — "
+              f"files written but NOT committed; re-run /conversation-archiver:upload")
+        return
+    if not had_changes:
+        print(f"nothing new to commit ({repo})")
+    # Always attempt a push — like --upload — even when nothing was committed this
+    # run, so commits a previous backfill made locally but failed to push still
+    # get retried on a later run.
+    res = do_push(repo)
+    if res.returncode != 0:
+        print(f"push skipped/failed — configure a remote: "
+              f"git -C {repo} remote add origin <url> && git -C {repo} push -u origin HEAD")
+    else:
+        print(f"pushed ({repo})")
+
+
 def _migrate_into_subdir(repo: Path, subdir: str) -> list[str]:
     """Move existing top-level ``YYYY-MM`` month dirs under ``subdir`` and
     rewrite the index + per-session state bookkeeping to the prefixed paths.
@@ -875,6 +994,9 @@ def main() -> None:
     if "--upload" in sys.argv:
         do_upload()
         return
+    if "--backfill" in sys.argv:
+        do_backfill()
+        return
     if "--connect" in sys.argv:
         # Primary: a single sb-connect/<code> link (one-time code redeem).
         # Zero-arg self-resolves via gsk login; explicit <remote_url> <token>
@@ -910,7 +1032,8 @@ def main() -> None:
         _archive_locked(session_id, tpath, event)
 
 
-def _archive_locked(session_id: str, tpath: Path, event: str) -> None:
+def _archive_locked(session_id: str, tpath: Path, event: str,
+                    do_commit: bool = True) -> None:
     cfg = load_config()
     repo = get_repo(cfg)
     mode = get_mode(cfg)
@@ -1041,7 +1164,9 @@ def _archive_locked(session_id: str, tpath: Path, event: str) -> None:
 
     # 5. Commit / push according to mode. Manual mode only writes the file;
     #    the /conversation-archiver:upload command commits + pushes on demand.
-    if mode != "auto":
+    #    do_commit=False (backfill) writes only — the caller commits + pushes
+    #    once for the whole sweep instead of once per session.
+    if not do_commit or mode != "auto":
         return
 
     run_git(repo, "add", "-A")
