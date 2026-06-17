@@ -24,8 +24,9 @@ hook also records the plugin's path so the `:upload` command can find `archive.p
 
 ## How it works
 
-A `Stop` hook (fires right after each assistant turn), a `UserPromptSubmit` hook
-(fires when you send your next message), and a `SessionEnd` hook run
+A `Stop` hook (fires right after each assistant turn), a `SubagentStop` hook
+(fires when an async subagent / background Task finishes), a `UserPromptSubmit`
+hook (fires when you send your next message), and a `SessionEnd` hook run
 `scripts/archive.py`, which:
 
 1. Reads the hook payload (`session_id`, `transcript_path`) from stdin.
@@ -42,11 +43,17 @@ A `Stop` hook (fires right after each assistant turn), a `UserPromptSubmit` hook
 
 ### When it archives
 
-The archiver runs on three events, layered so the result is both prompt and
+The archiver runs on four events, layered so the result is both prompt and
 complete:
 
 - **`Stop`** (right after each assistant turn) — low-latency: your answer lands in
   git as soon as the turn finishes, instead of waiting for your next message.
+- **`SubagentStop`** (an async subagent / background Task finishes) — flushes the
+  conversation as soon as a long-running async task completes, even if you've
+  stepped away and won't send another message for a while. The hook is handed the
+  *subagent's* transcript, so the archiver detects that (a sidechain transcript
+  under `…/subagents/`) and redirects to the **main** session transcript — the
+  subagent's own task prompt and replies are never archived.
 - **`UserPromptSubmit`** (your next message) — a backstop. When a `Stop` hook fires,
   the turn's final assistant message is not always flushed to the transcript JSONL
   yet, and a single answer often spans several assistant messages (text → tool call
@@ -160,16 +167,52 @@ Environment overrides (take precedence): `CC_ARCHIVE_MODE`, `CC_ARCHIVE_REPO`.
 
 ## Install
 
-This plugin lives in a local marketplace at the directory above
-(`toolkits/cc-conversation-archiver`). From a Claude Code session, use the
-absolute path of that directory on your machine:
+The plugin is **published** to its public Claude Code marketplace repo,
+[`genspark-ai/cc-conversation-archiver`](https://github.com/genspark-ai/cc-conversation-archiver).
+From a Claude Code session:
+
+```
+/plugin marketplace add genspark-ai/cc-conversation-archiver
+/plugin install conversation-archiver@cc-conversation-archiver
+```
+
+Then restart the session (hooks load at session start).
+
+### Updating
+
+Claude Code distributes and updates plugins from the marketplace git repo
+itself (a plugin is not a self-updating binary), so an update just re-pulls the
+latest published tree from that repo's `main`:
+
+```
+claude plugin update conversation-archiver@cc-conversation-archiver
+```
+
+Run it whenever a new version is released (the version lives in
+`.claude-plugin/plugin.json`), then restart the session so the refreshed hooks
+load.
+
+### Install from this monorepo (development)
+
+To run the in-development copy instead of the published one, point the
+marketplace at the absolute path of **this** plugin's marketplace directory on
+your machine (the folder containing `.claude-plugin/marketplace.json`):
 
 ```
 /plugin marketplace add /ABSOLUTE/PATH/TO/gen-spark/toolkits/cc-conversation-archiver
 /plugin install conversation-archiver@cc-conversation-archiver
 ```
 
-Then restart the session (hooks load at session start).
+### Releasing (maintainers)
+
+Development happens in the gen-spark monorepo under
+`toolkits/cc-conversation-archiver/**`; releases are **mirrored** to the public
+repo by the **CC Archiver Release** GitHub Action — never hand-edit the public
+repo. The flow: bump `version` in `.claude-plugin/plugin.json` via a normal
+reviewed PR, merge to `main`, then dispatch the workflow from `main` (it tags
+`conversation-archiver--v<version>`, cuts a matching GitHub Release, and refuses
+to run if that release already exists — which forces the version bump first).
+See [`RELEASING.md`](../../RELEASING.md) for the full procedure.
 
 ## Scope
 

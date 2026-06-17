@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claude Code conversation archiver — UserPromptSubmit / SessionEnd hook.
+"""Claude Code conversation archiver — Stop / SubagentStop / UserPromptSubmit / SessionEnd hook.
 
 Reads the hook payload from stdin (session_id, transcript_path, ...), parses the
 session transcript, extracts the user inputs and Claude's *text* replies (tool
@@ -575,6 +575,49 @@ def claude_projects_dir() -> Path:
     return Path(env).expanduser() if env else HOME / ".claude" / "projects"
 
 
+def _is_sidechain_transcript(tpath: Path) -> bool:
+    """True if ``tpath`` is a subagent (Task) transcript, not the main conversation.
+
+    Claude Code stores subagent transcripts under
+    ``<projects>/<proj>/<main-sid>/subagents/agent-*.jsonl`` and tags their
+    entries ``isSidechain: true``. A ``SubagentStop`` hook may hand us such a
+    path; archiving it directly would leak the subagent's task prompt and replies
+    into the session's archive file, so callers detect and redirect these to the
+    main transcript instead. Path-based detection is primary (free, matches the
+    documented layout); the ``isSidechain`` first-entry read is a cheap fallback
+    in case the on-disk layout changes."""
+    if "subagents" in tpath.parts:
+        return True
+    try:
+        with tpath.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                return bool(isinstance(entry, dict) and entry.get("isSidechain"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return False
+
+
+def _main_transcript_for(session_id: str) -> Path | None:
+    """Locate a session's MAIN transcript (``<projects>/<proj>/<sid>.jsonl``) by id.
+
+    Used to redirect a ``SubagentStop`` payload that points at a subagent
+    (sidechain) transcript back to the real conversation. The subagent transcript
+    carries the *parent* session id (verified on disk), so the lookup is exact.
+    Returns None if no such top-level transcript exists (then the caller skips
+    rather than archiving sidechain content)."""
+    projects = claude_projects_dir()
+    if not session_id or not projects.is_dir():
+        return None
+    for cand in projects.glob(f"*/{session_id}.jsonl"):
+        if cand.is_file():
+            return cand
+    return None
+
+
 def transcript_session_id(tpath: Path) -> str | None:
     """Session id for a transcript: the ``sessionId`` field if present, else the
     filename stem (Claude Code names each transcript ``<session-id>.jsonl``)."""
@@ -1021,6 +1064,20 @@ def main() -> None:
     tpath = Path(transcript_path)
     if not tpath.exists():
         return
+
+    # A SubagentStop hook (and any sidechain) may hand us a *subagent* transcript
+    # — the Task's own prompt + replies, stored under <main-sid>/subagents/. Never
+    # archive that into the session file: redirect to the MAIN transcript (the
+    # subagent transcript carries the parent session id) so an async-task
+    # completion just flushes the real conversation, exactly as Stop does. If the
+    # main transcript can't be located, skip rather than archive sidechain content.
+    if _is_sidechain_transcript(tpath):
+        main_tpath = _main_transcript_for(session_id)
+        if main_tpath is None:
+            log(f"{event}: sidechain transcript, no main transcript for "
+                f"{short_sid(session_id)} — skipping")
+            return
+        tpath = main_tpath
 
     # Serialize concurrent hook runs: different sessions share _index.json and
     # the one git repo, so without a lock two runs could pick the same filename,
