@@ -35,8 +35,10 @@ import hashlib
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -268,6 +270,79 @@ def session_start(path: Path) -> datetime:
 
 
 # --------------------------------------------------------------------------- #
+# Machine / environment metadata
+# --------------------------------------------------------------------------- #
+
+def machine_hostname() -> str:
+    """The computer's hostname, or '' if it can't be determined."""
+    try:
+        return socket.gethostname().strip()
+    except Exception:
+        return ""
+
+
+def machine_ip() -> str:
+    """Best-effort primary LAN IP of the machine, or '' on failure.
+
+    Opens a UDP socket toward a public address to discover which local
+    interface the OS would route through, then reads that interface's address.
+    No packets are actually sent (UDP connect only sets the destination), so
+    this works offline-ish and never blocks on the network."""
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return ""
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+def tmux_session() -> str | None:
+    """Name of the tmux session the hook is running under, or None if not in tmux.
+
+    Detects tmux via $TMUX (set inside every tmux pane), then asks tmux for the
+    current session name via ``display-message``. Returns None when tmux isn't
+    present, the binary is missing, or the query fails — the field is then
+    simply omitted from the archive."""
+    if not os.environ.get("TMUX"):
+        return None
+    try:
+        res = subprocess.run(
+            ["tmux", "display-message", "-p", "#S"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    name = res.stdout.strip()
+    return name or None
+
+
+def machine_meta() -> dict:
+    """Collect the host metadata stamped into each archive header: computer
+    name, LAN IP, and (when present) the tmux session name. Keys with no value
+    are omitted so the renderer only shows what was actually resolved."""
+    meta: dict = {}
+    host = machine_hostname()
+    if host:
+        meta["hostname"] = host
+    ip = machine_ip()
+    if ip:
+        meta["ip"] = ip
+    tmux = tmux_session()
+    if tmux:
+        meta["tmux"] = tmux
+    return meta
+
+
+# --------------------------------------------------------------------------- #
 # Filename / slug
 # --------------------------------------------------------------------------- #
 
@@ -382,7 +457,7 @@ def resolve_relpath(repo: Path, session_id: str, start: datetime,
 # --------------------------------------------------------------------------- #
 
 def render_markdown(session_id: str, start: datetime, title: str | None,
-                    blocks: list[dict]) -> str:
+                    blocks: list[dict], machine: dict | None = None) -> str:
     n_user = sum(1 for b in blocks if b["role"] == "user")
     n_asst = sum(1 for b in blocks if b["role"] == "assistant")
     heading = title or f"Session {short_sid(session_id)}"
@@ -392,6 +467,18 @@ def render_markdown(session_id: str, start: datetime, title: str | None,
         "",
         f"- **Session**: `{session_id}`",
         f"- **Started**: {start.strftime('%Y-%m-%d %H:%M %z')}",
+    ]
+    machine = machine or {}
+    host = machine.get("hostname")
+    ip = machine.get("ip")
+    if host or ip:
+        where = host or ""
+        if ip:
+            where = f"{where} ({ip})" if where else ip
+        lines.append(f"- **Machine**: {where}")
+    if machine.get("tmux"):
+        lines.append(f"- **tmux session**: `{machine['tmux']}`")
+    lines += [
         f"- **Turns archived**: {n_user} user / {n_asst} assistant",
         "",
         "---",
@@ -647,6 +734,50 @@ def transcript_has_content(tpath: Path) -> bool:
     for _ in parse_transcript(tpath):
         return True
     return False
+
+
+def _final_reply_pending(tpath: Path) -> bool:
+    """True while a Stop / SubagentStop turn's closing assistant text is still
+    being flushed — the precise signal the archiver waits on so it never commits
+    a reply-less turn during that race.
+
+    Claude Code writes the closing message's reasoning as a finalized
+    (``end_turn``) *thinking-only* block to the transcript a moment BEFORE it
+    writes that same message's sibling text. So a transcript whose LAST entry is
+    an ``end_turn`` thinking-only block has its visible reply imminent — wait for
+    it. Every other terminal state reports False so the poll exits immediately:
+    the text is already on disk (last entry is a text block), or the turn ended
+    on a tool call / produced no closing text (e.g. a SubagentStop fired while
+    the main turn's last act was a tool_use). That keeps tool-ending and
+    text-less turns at zero added latency. The rarer no-thinking flush race is
+    left to the existing next-event backstop."""
+    last_is_thinking = False
+    last_stop = None
+    try:
+        with tpath.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("type") == "assistant":
+                    msg = entry.get("message") or {}
+                    content = msg.get("content")
+                    kinds = ({b.get("type") for b in content if isinstance(b, dict)}
+                             if isinstance(content, list) else set())
+                    last_is_thinking = kinds == {"thinking"}
+                    last_stop = msg.get("stop_reason")
+                else:
+                    last_is_thinking = False
+                    last_stop = None
+    except OSError:
+        return False
+    return last_is_thinking and last_stop == "end_turn"
 
 
 def do_backfill() -> None:
@@ -1079,6 +1210,20 @@ def main() -> None:
             return
         tpath = main_tpath
 
+    # Close the Stop-vs-flush race: a Stop / SubagentStop hook can fire a few
+    # hundred ms before Claude Code writes the turn's closing assistant text to
+    # the transcript. Without this wait that reply is archived only on the NEXT
+    # event (next prompt / SessionEnd) — leaving the repo showing the question
+    # with no answer until then (observed: a 31-min gap). Poll ONLY while the
+    # reply is genuinely still in flight (never for a turn that produced no
+    # archivable text), and give up after ~3s so the hook can never hang — the
+    # existing next-event backstop still covers anything that lands later.
+    if event in ("Stop", "SubagentStop"):
+        for _ in range(6):
+            if not _final_reply_pending(tpath):
+                break
+            time.sleep(0.5)
+
     # Serialize concurrent hook runs: different sessions share _index.json and
     # the one git repo, so without a lock two runs could pick the same filename,
     # overwrite each other's markdown, and corrupt the index. The flock releases
@@ -1127,6 +1272,23 @@ def _archive_locked(session_id: str, tpath: Path, event: str,
         start = session_start(tpath)
         state["start"] = start.isoformat()
 
+    # Stamp the host metadata (computer name, LAN IP, tmux session) into state so
+    # the archive header records where the session ran. Refresh each run with
+    # whatever resolves now, but never let a transient blank (e.g. tmux query
+    # failure, offline IP lookup) clobber a value we captured earlier.
+    stored_machine = state.get("machine")
+    meta = dict(stored_machine) if isinstance(stored_machine, dict) else {}
+    fresh = machine_meta()
+    meta.update(fresh)
+    # tmux presence is authoritative when $TMUX is unset: the session is
+    # definitively NOT in tmux now, so drop any stale name a prior in-tmux turn
+    # stored. (When $TMUX IS set but the name query failed, machine_meta also
+    # omits "tmux" — but then we keep the prior value, since that's a transient
+    # failure rather than a real exit from tmux.)
+    if "tmux" not in fresh and not os.environ.get("TMUX"):
+        meta.pop("tmux", None)
+    state["machine"] = meta
+
     # 2. Resolve the (possibly new) per-session file path; handle title renames.
     #    ensure_repo first so the on-disk collision check sees real repo state.
     old_rel = state.get("file")
@@ -1162,7 +1324,8 @@ def _archive_locked(session_id: str, tpath: Path, event: str,
 
     # 3. Render the file from the full accumulated state (written in step 4,
     #    after cleanup, so a dir-pruning git rm can't race the write).
-    content = render_markdown(session_id, start, title, state["blocks"])
+    content = render_markdown(session_id, start, title, state["blocks"],
+                              state.get("machine"))
 
     # 3b. Enforce one-session-one-file: remove any *other* file the index still
     #     attributes to THIS session. The git-mv above migrates the path recorded
