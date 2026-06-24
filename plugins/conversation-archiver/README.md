@@ -101,6 +101,7 @@ model-invocable, so Claude can run it from a plain prompt:
 | `/conversation-archiver:auto` | **AUTO** — each turn writes the file, then `git commit` + `git push` (push runs in the background). Default. |
 | `/conversation-archiver:manual` | **MANUAL** — each turn writes the file locally only; no commit/push. |
 | `/conversation-archiver:upload` | Commit + push the whole archive now (use in manual mode). |
+| `/conversation-archiver:repo <path>` | Repoint the archive to a new local repo path. **Repoint-only**: updates the `repo` config and archives there from the next turn; the existing archive (and git history) is left untouched at the old path (never moved/copied/deleted). The new path is created on the next turn. If you were connected to Second Brain, re-run `:connect` so the new repo gets the remote. |
 | `/conversation-archiver:backfill` | Archive every existing Claude Code transcript on disk — the sessions that ran **before** the plugin was installed (the hooks never saw them) — then commit + push once. Idempotent: re-running only adds new turns. |
 | `/conversation-archiver:status` | Show current mode, repo path, remote, and recent commits. |
 | `/conversation-archiver:doctor` | **Diagnose** the setup — dependencies, config, repo, remote auth (read-only `git ls-remote` probe), sync state, and recent log errors — and print a verdict with fixes. Read-only; model-invocable so you can trigger it from a plain prompt. |
@@ -157,7 +158,10 @@ skipped (logged, never blocks the session).
 { "mode": "auto", "repo": "/home/you/claude-conversations" }
 ```
 
-Environment overrides (take precedence): `CC_ARCHIVE_MODE`, `CC_ARCHIVE_REPO`.
+The `repo` path can be changed with `/conversation-archiver:repo <path>`
+(repoint-only — see the table above). Environment overrides take precedence:
+`CC_ARCHIVE_MODE`, `CC_ARCHIVE_REPO` (so a `:repo` change won't take effect while
+`CC_ARCHIVE_REPO` is set).
 
 ## Files & logs (all under `~/.claude/cc-conversation-archiver/`)
 

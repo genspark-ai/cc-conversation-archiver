@@ -1162,6 +1162,67 @@ def do_connect(remote_url: str = "", token: str = "",
           f"{subdir}/{moved_note}. Mode: auto (every turn pushes).")
 
 
+def do_set_repo(path: str = "") -> None:
+    """Repoint the archive to a new local repo path (``archive.py --set-repo``),
+    invoked by /conversation-archiver:repo.
+
+    Option A — *repoint only*: it updates the ``repo`` path in config and nothing
+    else. From the next turn on, archiving writes to the new location; the
+    EXISTING archive (and its git history) is LEFT IN PLACE at the old path —
+    this command never moves, copies, or deletes it. The repo at the new path is
+    created on the next archived turn, exactly like a fresh install. (Ongoing
+    sessions rebuild their full markdown from accumulated state, so their
+    history re-materializes in the new repo on their next turn.)"""
+    path = (path or "").strip()
+    if not path:
+        print("usage: /conversation-archiver:repo <absolute path or ~/path>")
+        return
+    new = Path(path).expanduser()
+    if not new.is_absolute():
+        print(f"please pass an absolute path (or ~/...): got '{path}'")
+        return
+    if new.exists() and not new.is_dir():
+        print(f"not a directory: {new} — pass a folder path for the archive repo")
+        return
+
+    cfg = load_config()
+    new_str = str(new)
+    # The CONFIG's current archive path, env-independent and ~-expanded (the env
+    # override is surfaced separately below). DEFAULT_REPO when no key is set.
+    cur = cfg.get("repo")
+    config_old = Path(cur).expanduser() if cur else DEFAULT_REPO
+    if cur == new_str:
+        print(f"archive repo is already set to {new_str}")
+    elif config_old == new:
+        # The stored value differs textually (no key yet → the default, or a
+        # ``~``/unexpanded form) but resolves to the SAME directory — just persist
+        # the normalized value; do NOT claim a repoint that didn't happen.
+        cfg["repo"] = new_str
+        save_config(cfg)
+        print(f"archive repo confirmed at {new_str} "
+              "(location unchanged; config normalized).")
+    else:
+        cfg["repo"] = new_str
+        save_config(cfg)
+        print(f"archive repo path set to {new_str}")
+        print(f"(was {config_old}). Option A — repoint only: the previous archive "
+              "is left untouched at the old path; new turns archive to the new "
+              "path, which is created on the next archived turn.")
+
+    # These describe the EFFECTIVE archiving state, so print them whether we just
+    # changed the path or it was already set — otherwise an idempotent re-run
+    # could look successful while an env override silently archives elsewhere.
+    env_repo = os.environ.get("CC_ARCHIVE_REPO")
+    if env_repo:
+        print(f"WARNING: CC_ARCHIVE_REPO is set ({env_repo}) and overrides config, "
+              f"so archiving currently goes there — not to {new_str}. Unset it to "
+              "use the configured path.")
+    if get_subdir(cfg):
+        print("NOTE: you're connected to Second Brain — make sure this repo has "
+              "the vault remote (re-run /conversation-archiver:connect if needed), "
+              "otherwise archives here stay local-only.")
+
+
 # --------------------------------------------------------------------------- #
 # Doctor (diagnostics)
 # --------------------------------------------------------------------------- #
@@ -1447,6 +1508,10 @@ def main() -> None:
         return
     if "--doctor" in sys.argv:
         do_doctor()
+        return
+    if "--set-repo" in sys.argv:
+        args = sys.argv[sys.argv.index("--set-repo") + 1:]
+        do_set_repo(args[0] if args else "")
         return
     if "--connect" in sys.argv:
         # Primary: a single sb-connect/<code> link (one-time code redeem).

@@ -224,6 +224,7 @@ you straight from a prompt (e.g. *"diagnose my conversation archiver"*):
 | `/conversation-archiver:auto` | **AUTO** mode (default) — commit + push every turn. |
 | `/conversation-archiver:manual` | **MANUAL** mode — write the file locally only; no commit/push. |
 | `/conversation-archiver:upload` | Commit + push the whole archive now (use in manual mode). |
+| `/conversation-archiver:repo <path>` | Change where the archive lives (the local repo path). Repoint-only — see below. |
 
 Already had sessions before installing? Run `/conversation-archiver:backfill`
 once to capture them all.
@@ -239,7 +240,26 @@ Settings live in `~/.claude/cc-conversation-archiver/config.json`:
 - `repo` — where the archive lives (defaults to `~/claude-conversations`).
 - `mode` — `auto` or `manual`.
 
-Environment variables override the file: `CC_ARCHIVE_MODE`, `CC_ARCHIVE_REPO`.
+Environment variables override the file: `CC_ARCHIVE_MODE`, `CC_ARCHIVE_REPO`
+(when `CC_ARCHIVE_REPO` is set it takes precedence, so a `:repo` change won't
+take effect until you unset it).
+
+### Changing the archive location
+
+```
+/conversation-archiver:repo ~/Documents/claude-conversations
+```
+
+This **repoints only**: it updates the `repo` path in config, and from the next
+turn on, archiving writes to the new location. Your **existing archive (and its
+git history) is left untouched at the old path** — the command never moves,
+copies, or deletes it. The repo at the new path is created on the next archived
+turn, exactly like a fresh install (ongoing sessions re-materialize their full
+history there from accumulated state on their next turn). If you want the old
+content in the new repo too, move it yourself with `git`, or just re-run
+`/conversation-archiver:backfill` from the new location. If you'd connected the
+old repo to your Second Brain, re-run `/conversation-archiver:connect` so the new
+repo gets the remote.
 
 Other files under `~/.claude/cc-conversation-archiver/`: `state/` (per-session
 accumulated turns, local only), `archive.log`, and `push.log`.
