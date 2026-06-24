@@ -531,26 +531,34 @@ def body_covers(old_body: str, new_body: str) -> bool:
 # Git
 # --------------------------------------------------------------------------- #
 
-def run_git(repo: Path, *args: str, timeout: int = 30) -> subprocess.CompletedProcess:
+def run_git(repo: Path, *args: str, timeout: int = 30,
+            quiet: bool = False) -> subprocess.CompletedProcess:
     """Run git, tolerating a missing git binary or a timeout. A missing git
     (FileNotFoundError) or a command that exceeds `timeout` (TimeoutExpired)
     would otherwise raise mid-run and bypass every caller's returncode check —
     e.g. a slow `pull --rebase` would skip both the mid-rebase `rebase --abort`
     cleanup and the subsequent `git push`. Instead we return a synthetic
     non-zero CompletedProcess (rc=127 for missing git, rc=124 for timeout) so
-    callers degrade gracefully and the failure is logged once."""
+    callers degrade gracefully and the failure is logged once.
+
+    `quiet=True` suppresses those failure log writes — used by the read-only
+    `--doctor` path, which inspects git state and surfaces a missing binary or a
+    timeout in its own report; without quiet it would append to archive.log and
+    so pollute the very 'recent errors' section it is reading back."""
     try:
         return subprocess.run(
             ["git", "-C", str(repo), *args],
             capture_output=True, text=True, timeout=timeout,
         )
     except FileNotFoundError:
-        log("git not found on PATH")
+        if not quiet:
+            log("git not found on PATH")
         return subprocess.CompletedProcess(
             args=["git", *args], returncode=127, stdout="", stderr="git not found",
         )
     except subprocess.TimeoutExpired:
-        log(f"git timed out after {timeout}s: {' '.join(args)}")
+        if not quiet:
+            log(f"git timed out after {timeout}s: {' '.join(args)}")
         return subprocess.CompletedProcess(
             args=["git", *args], returncode=124, stdout="", stderr="git timed out",
         )
@@ -1155,6 +1163,272 @@ def do_connect(remote_url: str = "", token: str = "",
 
 
 # --------------------------------------------------------------------------- #
+# Doctor (diagnostics)
+# --------------------------------------------------------------------------- #
+
+def _log_tail(path: Path, n: int = 6) -> list[str]:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()[-n:]
+    except OSError:
+        return []
+
+
+# Redact the userinfo of an http(s) remote URL before printing it — a manually
+# configured remote can embed the push token directly, so the doctor must never
+# echo it back. Two credential shapes both leak and both must be masked:
+#   * ``https://user:<token>@host``   (token as the password)
+#   * ``https://<token>@host``        (token as the whole userinfo, no colon)
+# so the ``:<pass>`` half is optional. The password half may contain ``/`` or
+# ``+`` (e.g. a base64 Azure DevOps PAT / app-password), hence ``[^@\s]*`` there.
+# The user half excludes ``/`` so a credential-free URL whose *path* contains an
+# ``@`` (``https://host/a@b``) is NOT over-masked — the ``@`` we target is always
+# in the authority, before the first path ``/``. SSH remotes (``git@host:path``,
+# no ``://``) and credential-free URLs carry no secret and are left untouched.
+_URL_CRED_RE = re.compile(r"(https?://)[^/@\s]+(?::[^@\s]*)?@")
+
+
+def _mask_url(url: str) -> str:
+    return _URL_CRED_RE.sub(r"\1***@", url)
+
+
+def do_doctor() -> None:
+    """Diagnose the archiver setup (``archive.py --doctor``), invoked by
+    /conversation-archiver:doctor.
+
+    READ-ONLY: inspects dependencies, config, the archive repo, the remote
+    (with a live ``git ls-remote`` auth probe — read-only, never pushes), sync
+    state, recent activity, and recent log errors, then prints a structured
+    report ending in a verdict + concrete fixes. The slash command is
+    model-invocable, so a user can diagnose install / connect / sync problems
+    straight from a natural-language prompt and have Claude explain the result.
+    Never mutates the repo and never raises (top-level guard exits 0 anyway)."""
+    import shutil
+
+    cfg = load_config()
+    repo = get_repo(cfg)
+    mode = get_mode(cfg)
+    subdir = get_subdir(cfg)
+
+    lines: list[str] = []
+    problems: list[str] = []   # broken — needs a fix
+    notes: list[str] = []      # advisory — works, but worth knowing
+
+    def p(s: str = "") -> None:
+        lines.append(s)
+
+    def g(*args: str, timeout: int = 30) -> subprocess.CompletedProcess:
+        # Every git call the doctor makes is quiet: --doctor is read-only and
+        # must not append to archive.log on a missing-git / timeout path — that
+        # would pollute the very 'recent errors' section it reads back below.
+        return run_git(repo, *args, timeout=timeout, quiet=True)
+
+    p("# conversation-archiver doctor")
+    p("")
+
+    # --- Dependencies ---
+    p("## Dependencies")
+    p(f"- python3: OK ({sys.version.split()[0]})")
+    git_path = shutil.which("git")
+    if git_path:
+        p(f"- git: OK ({git_path})")
+    else:
+        p("- git: MISSING — archiving is disabled until git is on PATH")
+        problems.append("Install git and ensure it's on your PATH.")
+    p("")
+
+    # --- Config ---
+    p("## Config")
+    p(f"- mode: {mode}" + (
+        "  (each turn is committed + pushed)" if mode == "auto"
+        else "  (turns saved locally; committed + pushed only on "
+             "/conversation-archiver:upload)"))
+    p(f"- repo: {repo}")
+    if subdir:
+        p(f"- subdir: {subdir}/ (Second Brain connected mode)")
+    if os.environ.get("CC_ARCHIVE_MODE") or os.environ.get("CC_ARCHIVE_REPO"):
+        p("- note: CC_ARCHIVE_* environment override(s) are active")
+    p("")
+
+    # Without a git binary every `git` probe below returns empty/rc!=0, which
+    # would misreport a real repo/remote as absent — so gate the git-dependent
+    # sections on git being present (the missing binary is already a problem
+    # above) and report them as skipped rather than asserting a false state.
+    git_ok = git_path is not None
+
+    # --- Archive repo ---
+    p("## Archive repo")
+    is_git = (repo / ".git").exists()
+    if not repo.exists():
+        p("- not created yet — the repo is initialized on the first archived turn")
+    elif not is_git:
+        p(f"- {repo} exists but is not a git repo yet (created on the first turn)")
+    elif not git_ok:
+        p("- git repo present, but git is not on PATH — repo/sync checks skipped")
+    else:
+        p("- git repo: OK")
+        last = g("log", "-1", "--format=%cd | %s", "--date=local")
+        p(f"- last commit: {last.stdout.strip() or '(none yet)'}")
+        pending = g("status", "--porcelain").stdout.strip()
+        p(f"- pending uncommitted changes: "
+          f"{len(pending.splitlines()) if pending else 0}")
+    p("")
+
+    # --- Sync / remote ---
+    p("## Sync / remote")
+    if not is_git:
+        p("- no remote yet (repo not initialized)")
+    elif not git_ok:
+        p("- skipped — git is not on PATH, so the remote can't be inspected")
+    else:
+        rv = g("remote", "-v")
+        remotes = rv.stdout.strip()
+        if rv.returncode != 0:
+            # git is present (checked above) but the query itself failed —
+            # report the failure instead of claiming there is no remote.
+            p("- remote: UNKNOWN — `git remote` failed; can't determine sync state")
+            notes.append(
+                "Couldn't query git remotes (git command failed). Re-run "
+                "/conversation-archiver:doctor once git works to verify syncing."
+            )
+        elif not remotes:
+            p("- remote: NONE — commits stay LOCAL only; conversations are not synced")
+            notes.append(
+                "No git remote configured, so the archive is local-only. To sync "
+                "off this machine, run /conversation-archiver:connect (Second "
+                "Brain) or add a personal git remote (README step 3)."
+            )
+        else:
+            # Probe the remote `git push` will ACTUALLY use, so the connection
+            # test matches the real push path. do_push runs a bare `git push`,
+            # which follows the current branch's upstream remote (--connect sets
+            # push.default=upstream). Derive that remote from @{u}; only when no
+            # upstream is configured do we fall back to 'origin' (else the first
+            # remote) as a best guess. Display and probe always use the same name.
+            names = g("remote").stdout.split()
+            up = g("rev-parse", "--abbrev-ref", "--symbolic-full-name",
+                   "@{u}").stdout.strip()
+            up_remote = up.split("/", 1)[0] if "/" in up else ""
+            if up_remote and up_remote in names:
+                name = up_remote
+            elif "origin" in names:
+                name = "origin"
+            else:
+                name = names[0]
+            url = next((parts[1] for ln in remotes.splitlines()
+                        if (parts := ln.split()) and parts[0] == name
+                        and parts[-1] == "(push)"), "")
+            p(f"- remote: {name} -> {_mask_url(url)}")
+            if not up:
+                notes.append(
+                    f"No upstream is set for the current branch, so `git push` "
+                    f"has no default target; the test below probes '{name}' as a "
+                    "best guess. Set one with 'git push -u origin HEAD' (or re-run "
+                    "/conversation-archiver:connect)."
+                )
+            elif name != "origin":
+                notes.append(
+                    f"Your push remote is '{name}', not 'origin' (the name the "
+                    "README's connect/setup steps use). Pushes still work as long "
+                    "as the branch tracks it (see the upstream line)."
+                )
+            # Live, read-only auth probe — verifies reachability + credentials
+            # WITHOUT pushing anything.
+            ls = g("ls-remote", "--heads", name, timeout=20)
+            if ls.returncode == 0:
+                p(f"- connection test (git ls-remote {name}): OK — reachable, auth works")
+            elif ls.returncode == 124:
+                # run_git returns rc 124 on timeout — a slow/offline network, NOT
+                # an auth failure, so don't send the user chasing credentials.
+                p(f"- connection test (git ls-remote {name}): TIMED OUT (>20s)")
+                notes.append(
+                    "The remote didn't respond within 20s — likely a slow or "
+                    "offline network rather than an auth problem. Re-run "
+                    "/conversation-archiver:doctor when you're back online."
+                )
+            else:
+                p(f"- connection test (git ls-remote {name}): FAILED")
+                for e in (((ls.stderr or "") + (ls.stdout or "")).strip()
+                          .splitlines()[:4]):
+                    p(f"    {_mask_url(e)}")
+                problems.append(
+                    "Remote is configured but not reachable/authorized. Check auth "
+                    "(SSH key loaded in your agent, or a stored HTTPS token) and the "
+                    "remote URL — see README step 3."
+                )
+            p(f"- upstream: {up}" if up else
+              "- upstream: not set (first push uses 'git push -u origin HEAD')")
+    p("")
+
+    # --- Second Brain credential ---
+    if subdir:
+        p("## Second Brain credential")
+        if CRED_FILE.exists():
+            p(f"- credential file: present ({oct(CRED_FILE.stat().st_mode & 0o777)})")
+        else:
+            p("- credential file: MISSING")
+            problems.append(
+                "Second Brain credential file is missing — re-run "
+                "/conversation-archiver:connect to refresh it."
+            )
+        p("")
+
+    # --- Archive activity ---
+    p("## Archive activity")
+    state_files = ([f for f in STATE_DIR.glob("*.json") if f != INDEX_PATH]
+                   if STATE_DIR.exists() else [])
+    p(f"- sessions tracked (state files): {len(state_files)}")
+    if state_files:
+        newest = max(state_files, key=lambda f: f.stat().st_mtime)
+        ts = datetime.fromtimestamp(newest.stat().st_mtime).strftime(
+            "%Y-%m-%d %H:%M:%S")
+        p(f"- most recent archived turn: {ts}")
+    else:
+        p("- none yet — if you've been chatting, restart the session so the "
+          "hooks load, then send a message")
+        notes.append(
+            "No sessions archived yet. Hooks load at session start, so after "
+            "installing/updating the plugin you must restart the Claude Code "
+            "session. Existing pre-install sessions: run "
+            "/conversation-archiver:backfill."
+        )
+    p("")
+
+    # --- Recent errors / push output ---
+    err_lines = [ln for ln in _log_tail(LOG_PATH, 200)
+                 if "ERROR" in ln or "failed" in ln]
+    if err_lines:
+        p("## Recent errors (archive.log)")
+        for ln in err_lines[-6:]:
+            p(f"- {_mask_url(ln)}")
+        p("")
+    push_tail = _log_tail(PUSH_LOG, 4)
+    if push_tail:
+        p("## Recent push output (push.log)")
+        for ln in push_tail:
+            p(f"- {_mask_url(ln)}")
+        p("")
+
+    # --- Verdict ---
+    p("## Verdict")
+    if problems:
+        p(f"Found {len(problems)} problem(s) to fix:")
+        for i, pr in enumerate(problems, 1):
+            p(f"  {i}. {pr}")
+    elif notes:
+        p("Healthy, with notes:")
+        for i, nt in enumerate(notes, 1):
+            p(f"  {i}. {nt}")
+    elif mode == "manual":
+        p("All checks passed — archiving is set up. Mode is MANUAL: turns are "
+          "saved locally and committed/pushed only when you run "
+          "/conversation-archiver:upload.")
+    else:
+        p("All checks passed — archiving is set up and syncing.")
+
+    print("\n".join(lines))
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 
@@ -1170,6 +1444,9 @@ def main() -> None:
         return
     if "--backfill" in sys.argv:
         do_backfill()
+        return
+    if "--doctor" in sys.argv:
+        do_doctor()
         return
     if "--connect" in sys.argv:
         # Primary: a single sb-connect/<code> link (one-time code redeem).
