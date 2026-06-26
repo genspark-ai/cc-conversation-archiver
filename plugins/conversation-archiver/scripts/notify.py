@@ -83,10 +83,56 @@ def _wrap_for_tmux(seq: str) -> str:
     return "\033Ptmux;" + inner + "\033\\"
 
 
+def _target_tty() -> str | None:
+    """Best terminal device to write the sequence to.
+
+    Claude Code runs hooks DETACHED from the controlling terminal, so /dev/tty
+    is ENXIO ("Device not configured") inside a hook — we cannot rely on it.
+    Resolution order:
+      1. tmux: the current pane's tty (``#{pane_tty}``). Writing there feeds
+         tmux's pane output, which forwards via passthrough to the attached
+         client — works even with no controlling terminal.
+      2. /dev/tty, when we actually have a controlling terminal (a tool invoked
+         interactively, not as a detached hook).
+      3. the controlling tty of an ancestor process (the shell / app pty), for a
+         detached hook running in a non-tmux terminal.
+    Returns the device path, or None if none could be resolved.
+    """
+    if os.environ.get("TMUX"):
+        try:
+            r = subprocess.run(["tmux", "display-message", "-p", "#{pane_tty}"],
+                               capture_output=True, text=True, timeout=5)
+            t = r.stdout.strip()
+            if t:
+                return t
+        except (FileNotFoundError, subprocess.SubprocessError):
+            pass
+    try:
+        fd = os.open("/dev/tty", os.O_WRONLY | os.O_NOCTTY)
+        os.close(fd)
+        return "/dev/tty"
+    except OSError:
+        pass
+    pid = os.getppid()
+    for _ in range(8):
+        if pid <= 1:
+            break
+        try:
+            tty = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)],
+                                 capture_output=True, text=True, timeout=5).stdout.strip()
+            if tty and tty not in ("??", "?", "-"):
+                return tty if tty.startswith("/dev/") else "/dev/" + tty
+            pid = int(subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)],
+                                     capture_output=True, text=True, timeout=5).stdout.strip() or "1")
+        except (FileNotFoundError, subprocess.SubprocessError, ValueError):
+            break
+    return None
+
+
 def emit(source: str, source_id: str, event: str, title: str,
          body: str = "", tmux: dict | None = None) -> bool:
-    """Emit one notification to the controlling terminal. Returns True if the
-    sequence was written, False otherwise (no tty, write error). Never raises."""
+    """Emit one notification to the terminal. Returns True if the sequence was
+    written, False otherwise (no usable tty, write error). Never raises."""
     if not source or not source_id or not title:
         return False
     payload: dict = {
@@ -116,10 +162,16 @@ def emit(source: str, source_id: str, event: str, title: str,
             pass
         seq = _wrap_for_tmux(seq)
 
+    target = _target_tty()
+    if not target:
+        return False
     try:
-        with open("/dev/tty", "w", encoding="utf-8") as tty:
-            tty.write(seq)
-            tty.flush()
+        # O_NOCTTY: never let writing to a tty make it our controlling terminal.
+        fd = os.open(target, os.O_WRONLY | os.O_NOCTTY)
+        try:
+            os.write(fd, seq.encode("utf-8"))
+        finally:
+            os.close(fd)
         return True
     except OSError:
         return False
