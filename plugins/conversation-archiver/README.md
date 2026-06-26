@@ -224,3 +224,50 @@ See [`RELEASING.md`](../../RELEASING.md) for the full procedure.
 
 The hook fires for **every** Claude Code session regardless of project; all
 sessions are archived into the one repo, partitioned by month.
+
+## GenTerminal inbox notifications
+
+When the session runs inside the **GenTerminal** app, the archiver pushes a
+notification into GenTerminal's in-app inbox on **Stop** (a turn finished) and
+**SessionEnd** — so you can step away and get pulled back when Claude is done.
+Clicking the notification jumps to that terminal tab and, if the session is
+running under tmux, switches tmux to the right window.
+
+This works in local, SSH, and mesh tabs alike: the notification is written as an
+OSC escape sequence to the controlling terminal, so it rides the terminal stream
+back to the originating tab — no network port, token, or tunnel involved. Under
+tmux it is wrapped in tmux's DCS passthrough (and `allow-passthrough` is enabled
+best-effort). If the session is not in a GenTerminal tab, the sequence is simply
+ignored — archiving is unaffected.
+
+Set `CC_ARCHIVE_NO_NOTIFY=1` to disable these notifications entirely (archiving
+still runs as normal).
+
+### Reusing the notification mechanism
+
+`scripts/notify.py` is tool-agnostic — any CLI tool can surface a GenTerminal
+inbox notification the same way. The wire format is documented at the top of
+that file (also parsed by GenTerminal's `utils/osc.ts`):
+
+```
+ESC ] 9999 ; <base64(JSON)> ESC \
+```
+
+From Python:
+
+```python
+import notify
+notify.emit(source="my-tool", source_id="run-123",
+            event="done", title="Build finished", body="42 tests passed",
+            tmux=notify.tmux_context())
+```
+
+From a shell:
+
+```sh
+python3 path/to/notify.py --source my-tool --source-id run-123 \
+    --title "Build finished" --body "42 tests passed"
+```
+
+`source_id` groups notifications: a new notification with the same `source_id`
+on the same tab replaces the previous one in the inbox instead of stacking.

@@ -1573,11 +1573,50 @@ def main() -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     with open(ARCHIVE_LOCK, "w") as lockf:
         fcntl.flock(lockf, fcntl.LOCK_EX)
-        _archive_locked(session_id, tpath, event)
+        summary = _archive_locked(session_id, tpath, event)
+
+    # Surface a GenTerminal inbox notification when a turn finishes (Stop) or the
+    # session ends. Other events (UserPromptSubmit / SubagentStop) still archive
+    # but stay silent so the inbox isn't noisy. Done OUTSIDE the lock so the tty
+    # write never holds up another session's archive. Best-effort throughout.
+    if summary is not None and event in ("Stop", "SessionEnd"):
+        _maybe_notify(session_id, event, summary)
+
+
+def _maybe_notify(session_id: str, event: str, summary: dict) -> None:
+    """Push a GenTerminal inbox notification for this archive. Imported lazily
+    and fully guarded so a missing module or any runtime error never disrupts
+    the hook (which must always exit 0)."""
+    # Opt-out: lets users (and the test suite) disable notifications entirely
+    # without affecting archiving.
+    if os.environ.get("CC_ARCHIVE_NO_NOTIFY"):
+        return
+    try:
+        import notify  # sibling module in this scripts/ dir
+    except Exception:
+        return
+    try:
+        title = summary.get("title") or "Claude Code"
+        turns = summary.get("turns", 0)
+        unit = "turn" if turns == 1 else "turns"
+        if event == "SessionEnd":
+            body = f"Session ended · {turns} {unit} archived"
+        else:
+            body = f"Turn complete · {turns} {unit} archived"
+        notify.emit(
+            source="conversation-archiver",
+            source_id=session_id,
+            event=event,
+            title=title,
+            body=body,
+            tmux=notify.tmux_context(),
+        )
+    except Exception:
+        log("notify failed\n" + traceback.format_exc())
 
 
 def _archive_locked(session_id: str, tpath: Path, event: str,
-                    do_commit: bool = True) -> None:
+                    do_commit: bool = True) -> dict | None:
     cfg = load_config()
     repo = get_repo(cfg)
     mode = get_mode(cfg)
@@ -1724,23 +1763,36 @@ def _archive_locked(session_id: str, tpath: Path, event: str,
     log(f"{event}: session={short_sid(session_id)} +{new_count} blocks "
         f"total={len(state['blocks'])} mode={mode} file={new_rel}")
 
+    # Summary handed back to the caller so it can surface a GenTerminal inbox
+    # notification without re-deriving the counts / title. `turns` counts user
+    # prompts (one per turn) rather than every block, since state["blocks"]
+    # also holds assistant replies and compact dividers.
+    summary = {
+        "new_count": new_count,
+        "total": len(state["blocks"]),
+        "turns": sum(1 for b in state["blocks"] if b.get("role") == "user"),
+        "title": title,
+        "file": new_rel,
+    }
+
     # 5. Commit / push according to mode. Manual mode only writes the file;
     #    the /conversation-archiver:upload command commits + pushes on demand.
     #    do_commit=False (backfill) writes only — the caller commits + pushes
     #    once for the whole sweep instead of once per session.
     if not do_commit or mode != "auto":
-        return
+        return summary
 
     run_git(repo, "add", "-A")
     status = run_git(repo, "status", "--porcelain")
     if not status.stdout.strip():
-        return
+        return summary
     msg = f"archive: {start.strftime('%Y-%m-%d')} {title or short_sid(session_id)}"
     commit = run_git(repo, "commit", "-m", msg)
     if commit.returncode != 0:
         log(f"commit failed: {commit.stderr.strip()}")
-        return
+        return summary
     push_background(repo)
+    return summary
 
 
 if __name__ == "__main__":
