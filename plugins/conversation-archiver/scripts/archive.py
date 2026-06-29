@@ -128,8 +128,14 @@ def save_config(cfg: dict) -> None:
 # --------------------------------------------------------------------------- #
 
 _SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
-# Slash-command / local-command wrappers that show up as "user" string content.
-_COMMAND_WRAPPER_RE = re.compile(r"^\s*<(command-[a-z-]+|local-command-[a-z-]+)>")
+# A slash-command invocation arrives as "user" content carrying the command name
+# and the typed args in separate tags (their order varies). The skill/command
+# body it expands into arrives as a separate isMeta entry we already skip.
+_COMMAND_NAME_RE = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.DOTALL)
+_COMMAND_ARGS_RE = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.DOTALL)
+# Other command / local-command plumbing (the local `!cmd` caveat + stdout, or a
+# bare wrapper with no command-name) is machinery, not the user's input.
+_COMMAND_WRAPPER_RE = re.compile(r"^\s*<(command|local-command)-[a-z-]+>")
 
 
 def _clean_user_text(content) -> str | None:
@@ -155,6 +161,16 @@ def _clean_user_text(content) -> str | None:
     text = _SYSTEM_REMINDER_RE.sub("", text).strip()
     if not text:
         return None
+    if "<command-name>" in text:
+        # A slash command IS the user's input. This entry used to be dropped
+        # entirely, which erased the opening turn of any command-initiated
+        # session — the archive then started at the assistant's reply. Keep it
+        # as the typed "/command args" line (args carry the real question).
+        name_m = _COMMAND_NAME_RE.search(text)
+        args_m = _COMMAND_ARGS_RE.search(text)
+        name = name_m.group(1).strip() if name_m else ""
+        args = args_m.group(1).strip() if args_m else ""
+        return f"{name} {args}".strip() or None
     if _COMMAND_WRAPPER_RE.match(text):
         return None
     return text
@@ -525,6 +541,20 @@ def body_covers(old_body: str, new_body: str) -> bool:
         return True
     return (new_body.startswith(old_body)
             and new_body[len(old_body):].startswith("\n\n"))
+
+
+def _on_disk_covered(path: Path, new_body: str) -> bool:
+    """Whether the archive already at ``path`` is fully contained (as a
+    turn-boundary prefix) in ``new_body`` — i.e. overwriting it loses nothing.
+
+    Returns False if the file can't be read: a read error must NOT be mistaken
+    for "empty, safe to overwrite" (treating the body as "" would make
+    body_covers report covered and let a smaller render replace richer,
+    unreadable-but-real content). The never-shrink guard then preserves it."""
+    try:
+        return body_covers(turns_body(path.read_text(encoding="utf-8")), new_body)
+    except OSError:
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -1748,6 +1778,29 @@ def _archive_locked(session_id: str, tpath: Path, event: str,
                     continue
             log(f"cleaned stale duplicate {rel} for session {short_sid(session_id)}")
         index.pop(rel, None)
+
+    # 3c. Never-shrink guard. State (append-only) is normally a superset of what
+    #     is on disk, so an earlier render is always a turn-boundary prefix of
+    #     the new one. If it is NOT — the file on disk holds turns the new render
+    #     would drop — then state has diverged from disk: a wiped/corrupt state
+    #     file, or an archive copy synced from another machine where this session
+    #     ran. Overwriting would lose those turns. So release our claim on the
+    #     richer file (it stays on disk, preserved, and is committed as-is) and
+    #     re-resolve to a fresh suffixed path for this render — the SAME suffixing
+    #     resolve_relpath applies to any occupied name. That keeps the session on
+    #     the new path on later turns (resolve_relpath returns it as the owner)
+    #     instead of resolving back onto the richer file and renaming over it. A
+    #     file we can't read is treated as not-covered too — see _on_disk_covered.
+    if new_abs.exists() and not _on_disk_covered(new_abs, new_body):
+        index.pop(new_rel, None)
+        save_index(index)  # persist the release so resolve_relpath sees it
+        diverted = resolve_relpath(repo, session_id, start, title, None,
+                                   subdir=get_subdir(cfg))
+        log(f"never-shrink: {new_rel} is richer than current state "
+            f"(state loss or unreadable); preserving it, diverting render to "
+            f"{diverted}")
+        new_rel = diverted
+        new_abs = repo / new_rel
 
     # 4. Write the file. Re-ensure the parent dir: a `git rm` above can prune a
     #    now-empty month directory, which would otherwise make the write fail.
