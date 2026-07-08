@@ -170,6 +170,12 @@ def _clean_user_text(content) -> str | None:
         args_m = _COMMAND_ARGS_RE.search(text)
         name = name_m.group(1).strip() if name_m else ""
         args = args_m.group(1).strip() if args_m else ""
+        if name == "/clear":
+            # /clear is session plumbing, never input: Claude Code seeds its
+            # record into the NEW session's transcript, so keeping it archived
+            # a bare "/clear" turn (or a whole junk file) into every cleared
+            # session.
+            return None
         return f"{name} {args}".strip() or None
     if _COMMAND_WRAPPER_RE.match(text):
         return None
@@ -212,10 +218,39 @@ def _compact_divider(entry: dict) -> str:
     )
 
 
-def parse_transcript(path: Path):
-    """Yield ordered (key, role, text) blocks for new content.
+def _queued_prompt(entry: dict) -> str | None:
+    """The human-typed text of a queued (mid-turn) message, or None.
 
-    role is one of: "user", "assistant", "compact".
+    A message sent while Claude is still working is NOT recorded as a
+    ``type: "user"`` entry — only as a ``queue-operation`` line plus an
+    ``attachment`` of type ``queued_command`` carrying the prompt. Without
+    handling it, every mid-turn user message silently vanishes from the
+    archive."""
+    if entry.get("type") != "attachment":
+        return None
+    att = entry.get("attachment") or {}
+    if att.get("type") != "queued_command":
+        return None
+    if (att.get("origin") or {}).get("kind") != "human":
+        return None
+    prompt = (att.get("prompt") or "").strip()
+    return prompt or None
+
+
+def _content_entries(path: Path):
+    """Yield ordered (entry, role, text) for every archivable block.
+
+    role is one of: "user", "assistant", "compact". Shared by
+    parse_transcript (block extraction) and session_start (first-content
+    timestamp) so both agree on what counts as content.
+
+    A message typed while Claude is still working lands as a
+    ``queued_command`` attachment; a message submitted normally lands as a
+    ``type: "user"`` entry — one shape per message, never both (verified
+    across 34 real queued prompts: zero reappeared as a user entry). So each
+    shape is archived as a user turn with NO cross-shape text deduplication:
+    text-based suppression would drop a genuine turn whenever the user
+    re-sends the same words (queued or typed) later in the session.
     """
     with path.open(encoding="utf-8") as fh:
         for line in fh:
@@ -235,19 +270,36 @@ def parse_transcript(path: Path):
                     continue
                 text = _clean_user_text((entry.get("message") or {}).get("content"))
                 if text:
-                    yield _entry_key(entry, "user", text), "user", text
+                    yield entry, "user", text
+            elif etype == "attachment":
+                text = _queued_prompt(entry)
+                if text:
+                    yield entry, "user", text
             elif etype == "assistant":
                 text = _assistant_text((entry.get("message") or {}).get("content"))
                 if text:
-                    yield _entry_key(entry, "assistant", text), "assistant", text
+                    yield entry, "assistant", text
             elif etype == "system" and entry.get("subtype") == "compact_boundary":
-                text = _compact_divider(entry)
-                yield _entry_key(entry, "compact", text), "compact", text
+                yield entry, "compact", _compact_divider(entry)
+
+
+def parse_transcript(path: Path):
+    """Yield ordered (key, role, text) blocks for new content."""
+    for entry, role, text in _content_entries(path):
+        yield _entry_key(entry, role, text), role, text
 
 
 def session_title(path: Path) -> str | None:
-    """Last ai-title in the transcript, if any (titles are generated lazily)."""
-    title = None
+    """FIRST ai-title in the transcript, if any (titles are generated lazily).
+
+    First — not last — wins. Claude Code re-stamps ai-title entries
+    periodically from a cache that can hold a STALE title after /clear:
+    observed as seven consecutive post-clear sessions whose transcripts each
+    open with their own correct title (generated right after the first prompt)
+    and are later re-stamped with a title generated for a conversation days
+    earlier. Last-wins renamed every one of those archives to the stale title;
+    the first stamp is the one generated for THIS conversation.
+    """
     try:
         with path.open(encoding="utf-8") as fh:
             for line in fh:
@@ -259,13 +311,30 @@ def session_title(path: Path) -> str | None:
                     continue
                 if entry.get("type") == "ai-title" and entry.get("aiTitle"):
                     title = entry["aiTitle"].strip()
+                    if title:
+                        return title
     except Exception:
         pass
-    return title or None
+    return None
 
 
 def session_start(path: Path) -> datetime:
-    """Local-time datetime of the first timestamped entry (stable per session)."""
+    """Local-time datetime of the first *content* block (stable per session).
+
+    Keyed to the first archivable block — not to the transcript's first
+    timestamped entry — because a post-/clear transcript is seeded with the
+    /clear command record carrying the timestamp of when the PREVIOUS session
+    was cleared, which can be days before this session's first real prompt
+    (observed: a session first used on Jul 8 dated Jul 4 by its seed). Falls
+    back to the first timestamped entry of any kind, then to now.
+    """
+    try:
+        for entry, _role, _text in _content_entries(path):
+            ts = entry.get("timestamp")
+            if ts:
+                return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+    except Exception:
+        pass
     try:
         with path.open(encoding="utf-8") as fh:
             for line in fh:
@@ -1662,6 +1731,13 @@ def _archive_locked(session_id: str, tpath: Path, event: str,
         state["keys"].append(key)
         state["blocks"].append({"role": role, "text": text})
         new_count += 1
+
+    # No visible turn yet — e.g. a fresh post-/clear transcript holding only
+    # the seeded /clear record, or a tool-only session so far. Writing now
+    # would create (and commit) a header-only file for a session that may
+    # never be used; skip entirely — the first real turn archives normally.
+    if not state["blocks"]:
+        return None
 
     title = session_title(tpath)
     if title:
