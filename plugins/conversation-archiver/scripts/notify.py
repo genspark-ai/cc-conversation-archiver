@@ -130,9 +130,16 @@ def _target_tty() -> str | None:
 
 
 def emit(source: str, source_id: str, event: str, title: str,
-         body: str = "", tmux: dict | None = None) -> bool:
+         body: str = "", tmux: dict | None = None,
+         target_tty: str | None = None) -> bool:
     """Emit one notification to the terminal. Returns True if the sequence was
-    written, False otherwise (no usable tty, write error). Never raises."""
+    written, False otherwise (no usable tty, write error). Never raises.
+
+    `target_tty` overrides the device resolution: a fully detached process
+    (setsid daemon) has no controlling terminal AND no useful ancestor chain,
+    so _target_tty()'s non-tmux fallbacks both fail there. Callers that spawn
+    such a process should resolve the tty while they still can (hook context)
+    and pass it down."""
     if not source or not source_id or not title:
         return False
     payload: dict = {
@@ -162,7 +169,7 @@ def emit(source: str, source_id: str, event: str, title: str,
             pass
         seq = _wrap_for_tmux(seq)
 
-    target = _target_tty()
+    target = target_tty or _target_tty()
     if not target:
         return False
     try:

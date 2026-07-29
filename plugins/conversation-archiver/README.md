@@ -240,8 +240,24 @@ tmux it is wrapped in tmux's DCS passthrough (and `allow-passthrough` is enabled
 best-effort). If the session is not in a GenTerminal tab, the sequence is simply
 ignored — archiving is unaffected.
 
+### Session-title sync (GenTerminal sidebar)
+
+The plugin also reports the session's display title over the same channel
+(`TitleChanged`), which GenTerminal uses to name its sidebar "Sessions" rows
+and tabs. The title is the **first `ai-title`** Claude Code generates — unless
+you `/rename` the session, in which case **your explicit name wins** from then
+on.
+
+Timeliness: hook runs report a changed title within seconds during an active
+turn, and a small **per-session watcher** (`scripts/title_watch.py`, spawned
+automatically, POSIX only) covers the idle gaps — `/rename` fires no hook, so
+without the watcher an idle rename would only land at your next prompt. The
+watcher polls cheaply (stat fingerprints, ~1.5s), exits by itself when the
+`claude` process ends, and never double-reports (it shares the hook reporter's
+last-reported state).
+
 Set `CC_ARCHIVE_NO_NOTIFY=1` to disable these notifications entirely (archiving
-still runs as normal).
+still runs as normal; the watcher is not spawned either).
 
 ### Reusing the notification mechanism
 

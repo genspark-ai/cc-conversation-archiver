@@ -17,9 +17,16 @@ process registry first — archive.user_session_name — else the transcript's
 FIRST ai-title, the first-wins stale-after-/clear fix), and emit a
 notification when it changed. No git, no archive lock, no repo config: the
 whole run is one registry scan + one transcript scan plus at most one tty
-write. Note /rename itself fires no hook — the new name goes out on the next
-PostToolUse / UserPromptSubmit / Stop, i.e. within seconds during an active
-turn.
+write.
+
+/rename itself fires NO hook, so the hook cadence alone delivered a manual
+rename within seconds only during an active turn (PostToolUse) but not until
+the NEXT PROMPT when the session was idle — which is when humans actually
+rename (2026-07-30 report: "sometimes immediate, sometimes next prompt").
+ensure_watcher() below closes that gap: every hook run keeps a per-session
+title_watch.py daemon alive that polls the title sources and reports a change
+within ~2s regardless of hook timing. Watcher and hook share the
+last-reported state file, so they never double-report.
 
 State: the last REPORTED title lives in its own tiny file
 (state/<sid>.title), deliberately NOT in the archiver's per-session state
@@ -82,6 +89,111 @@ def forget(session_id: str) -> None:
         pass
 
 
+def watch_pidfile(session_id: str) -> Path:
+    """Pidfile of the session's title watcher daemon (title_watch.py). Written
+    ONLY by the spawner below; the daemon reads it and exits when a newer
+    watcher's pid replaces its own (spawn races converge to newest-wins)."""
+    return archive.STATE_DIR / f"{session_id}.watch"
+
+
+def watch_ttyfile(session_id: str) -> Path:
+    """Freshest resolvable target tty for the session's watcher daemon.
+
+    The daemon itself cannot resolve a tty outside tmux (setsid: no
+    controlling terminal, reparented to init so no useful ancestor chain), and
+    resolution CAN fail in the hook that happens to spawn the watcher (early
+    SessionStart). So the tty is decoupled from spawn time: EVERY hook run
+    refreshes this file when it can resolve a tty, and the daemon re-reads it
+    before each emit — a watcher born tty-less starts emitting the moment any
+    later hook run resolves one (Bugbot finding on the first cut: the spawn-
+    time --tty argv froze a missing tty for the daemon's whole lifetime)."""
+    return archive.STATE_DIR / f"{session_id}.tty"
+
+
+def _refresh_watch_tty(session_id: str) -> None:
+    """Best-effort: record the currently-resolvable target tty for the
+    daemon. Failures (no tty this run, unwritable state dir) leave the
+    previous value in place — never raise into the hook."""
+    try:
+        import notify  # noqa: PLC0415
+
+        tty = notify._target_tty()
+        if not tty:
+            return
+        tf = watch_ttyfile(session_id)
+        try:
+            if tf.read_text(encoding="utf-8").strip() == tty:
+                return
+        except Exception:
+            pass
+        archive.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = tf.with_suffix(".tty.tmp")
+        tmp.write_text(tty, encoding="utf-8")
+        tmp.replace(tf)
+    except Exception:
+        pass
+
+
+def _spawn_watcher(argv: list[str]) -> int | None:
+    """Start the watcher fully detached (own session, no inherited stdio) and
+    return its pid. Split out so tests can stub the actual process launch."""
+    import subprocess  # noqa: PLC0415
+
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    return proc.pid
+
+
+def ensure_watcher(session_id: str, transcript_path: Path) -> bool:
+    """Keep one title_watch.py daemon alive for the session; returns True when
+    a new one was spawned.
+
+    /rename fires no hook, so the hook-driven report() above only delivers a
+    manual rename on the NEXT hook event — next prompt, when the session is
+    idle. The daemon polls the title sources and closes that gap; every hook
+    run re-ensures it (cheap pidfile + kill(0) probe) so a crashed or
+    lifetime-expired watcher heals on the session's next activity.
+
+    The target tty travels through watch_ttyfile, refreshed on EVERY hook
+    run — not just at spawn — because the run that spawns the watcher may be
+    unable to resolve one (early SessionStart) while a later run can.
+    """
+    if os.name != "posix":
+        # Liveness probing is kill(0)-based; on Windows that terminates the
+        # probed process. The hook cadence remains the only reporter there.
+        return False
+    _refresh_watch_tty(session_id)
+    pf = watch_pidfile(session_id)
+    try:
+        os.kill(int(pf.read_text(encoding="utf-8").strip()), 0)
+        return False  # a watcher is alive
+    except Exception:
+        pass  # missing/garbled pidfile or dead pid — spawn a fresh one
+    try:
+        argv = [
+            sys.executable,
+            str(SCRIPTS / "title_watch.py"),
+            "--session-id", session_id,
+            "--transcript", str(transcript_path),
+        ]
+        pid = _spawn_watcher(argv)
+        if pid is None:
+            return False
+        archive.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = pf.with_suffix(".watch.tmp")
+        tmp.write_text(str(pid), encoding="utf-8")
+        tmp.replace(pf)
+        return True
+    except Exception:
+        return False
+
+
 def _body(session_id: str, resumed: bool) -> str:
     """Inbox-friendly body, consistent with the archive notifications
     ("Turn complete · N turns archived"). Reads the archiver state read-only;
@@ -108,14 +220,24 @@ def report(payload: dict) -> bool:
     if not session_id or not transcript_path:
         return False
     tpath = Path(transcript_path)
-    if not tpath.exists():
-        return False
     # A subagent sidechain transcript has no ai-title of its own — the title
     # lives in the main session transcript, same redirect the archiver does.
-    if archive._is_sidechain_transcript(tpath):
+    # (A sidechain payload whose main transcript cannot be found is the one
+    # case that spawns no watcher — the main session's own hooks do that.)
+    if tpath.exists() and archive._is_sidechain_transcript(tpath):
         tpath = archive._main_transcript_for(session_id)
         if tpath is None:
             return False
+
+    # Keep the per-session watcher daemon alive BEFORE the transcript-exists
+    # gate below: a brand-new session's SessionStart fires before the
+    # transcript is written, and an idle /rename needs only the process
+    # registry — the daemon tolerates a missing transcript and picks it up
+    # once it appears (Bugbot).
+    ensure_watcher(session_id, tpath)
+
+    if not tpath.exists():
+        return False
 
     # Explicit /rename outranks the transcript's ai-title (they are separate
     # channels — see archive.user_session_name). Without this, a manual
