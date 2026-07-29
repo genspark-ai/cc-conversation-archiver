@@ -345,14 +345,100 @@ def user_session_name(session_id: str) -> str | None:
     return best[2] if best else None
 
 
+def _stale_name_path(session_id: str) -> Path:
+    return STATE_DIR / f"{session_id}.stalename"
+
+
+def remember_stale_name(session_id: str, name: str) -> None:
+    """Snapshot a registry name that was carried over a /clear boundary so
+    effective_user_session_name ignores exactly that string for this session.
+    Written by report_title's clear handler; never raises."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _stale_name_path(session_id).with_suffix(".stalename.tmp")
+        tmp.write_text(name, encoding="utf-8")
+        tmp.replace(_stale_name_path(session_id))
+    except Exception:
+        pass
+
+
+def effective_user_session_name(session_id: str) -> str | None:
+    """user_session_name minus the name /clear drags across the boundary.
+
+    Claude Code KEEPS the explicit /rename name in the process registry when
+    /clear starts a new session id (verified live 2026-07-30 on 2.1.220:
+    same pid file, new sessionId, name retained with nameSource still
+    absent — and the old custom-title is even re-stamped into the new
+    transcript). Left alone, the PREVIOUS conversation's name would
+    permanently outrank every ai-title the new conversation generates. The
+    clear handler snapshots the carried name; an exact match is ignored
+    here, while a fresh /rename (any different string) wins as usual."""
+    name = user_session_name(session_id)
+    if not name:
+        return None
+    try:
+        stale = _stale_name_path(session_id).read_text(encoding="utf-8").strip()
+        if name == stale:
+            return None
+    except Exception:
+        pass
+    return name
+
+
+def _clear_label_path(session_id: str) -> Path:
+    return STATE_DIR / f"{session_id}.clearlabel"
+
+
+def remember_clear_label(session_id: str, label: str) -> None:
+    """Persist the /clear-time cwd-basename label as this session's
+    lowest-priority title source. Written by report_title's clear handler
+    BEFORE it attempts to emit, so a failed emit (no tty yet) is retried by
+    every later hook run and watcher tick through the ordinary
+    display_title path instead of being lost (Bugbot). Never raises."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _clear_label_path(session_id).with_suffix(".clearlabel.tmp")
+        tmp.write_text(label, encoding="utf-8")
+        tmp.replace(_clear_label_path(session_id))
+    except Exception:
+        pass
+
+
+def clear_label(session_id: str) -> str | None:
+    try:
+        value = _clear_label_path(session_id).read_text(encoding="utf-8").strip()
+        return value or None
+    except Exception:
+        return None
+
+
+def notification_title(session_id: str, ai_title: str | None) -> str | None:
+    """Title for outgoing notifications, same precedence as display_title
+    (explicit non-stale name > ai-title > /clear cwd label) but taking the
+    caller's already-resolved ai-title (the archive path holds it in state,
+    which survives transcript truncation) instead of re-scanning."""
+    return (
+        effective_user_session_name(session_id)
+        or ai_title
+        or clear_label(session_id)
+    )
+
+
 def display_title(session_id: str, transcript_path: Path) -> str | None:
-    """Title to surface to consumers (GenTerminal's Sessions sidebar): the
-    user's explicit name when one exists, else the transcript's ai-title.
-    Once a session has been manually renamed, later ai-title re-stamps no
-    longer override it. The ARCHIVE document keeps using the ai-title
-    (session_title) — the markdown title is a stable content identifier,
-    not a UI label."""
-    return user_session_name(session_id) or session_title(transcript_path)
+    """Title to surface to consumers (GenTerminal's Sessions sidebar), by
+    precedence: the user's explicit name when one exists (and was not
+    carried over a /clear — see effective_user_session_name), else the
+    transcript's ai-title, else the /clear-time cwd-basename label (a fresh
+    post-clear session has neither of the first two until its first
+    ai-title is generated). Once a session has been manually renamed, later
+    ai-title re-stamps no longer override it. The ARCHIVE document keeps
+    using the ai-title (session_title) — the markdown title is a stable
+    content identifier, not a UI label."""
+    return (
+        effective_user_session_name(session_id)
+        or session_title(transcript_path)
+        or clear_label(session_id)
+    )
 
 
 def session_title(path: Path) -> str | None:
@@ -2001,9 +2087,11 @@ def _archive_locked(session_id: str, tpath: Path, event: str,
         "new_count": new_count,
         "total": len(state["blocks"]),
         "turns": sum(1 for b in state["blocks"] if b.get("role") == "user"),
-        # Notification title only — a manual /rename outranks the ai-title
-        # (display_title); the archived document above keeps the ai-title.
-        "title": user_session_name(session_id) or title,
+        # Notification title only — full display precedence, so a
+        # turn-complete notification right after /clear cannot rename the
+        # sidebar away from the fresh cwd label; the archived document
+        # above keeps the ai-title.
+        "title": notification_title(session_id, title),
         "file": new_rel,
     }
 

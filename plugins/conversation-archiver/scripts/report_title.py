@@ -194,6 +194,51 @@ def ensure_watcher(session_id: str, transcript_path: Path) -> bool:
         return False
 
 
+def _report_clear(session_id: str, payload: dict) -> bool:
+    """/clear reset (2026-07-30 request): the new, empty conversation must
+    not keep wearing the previous conversation's name. Two steps:
+
+    1. Snapshot the registry name Claude Code carries across the boundary —
+       archive.effective_user_session_name ignores exactly that string for
+       this session from now on, so the old explicit name cannot outrank the
+       new conversation's ai-title (it otherwise would, forever).
+    2. Report the working directory's basename as the fresh label. The
+       conversation's own first ai-title replaces it later through the
+       ordinary changed-title path.
+    """
+    stale = archive.user_session_name(session_id)
+    if stale:
+        archive.remember_stale_name(session_id, stale)
+    # Hook payloads normally carry cwd, but older payload shapes omit fields
+    # (see the `source` default above) — the hook process itself runs in the
+    # project directory, so its own cwd is an equivalent fallback (Bugbot).
+    cwd = payload.get("cwd") or os.getcwd()
+    title = Path(cwd).name.strip()
+    if not title:
+        return False
+    # Persist BEFORE emitting: as the lowest-priority display_title source,
+    # a label whose emit fails here (no tty yet) is delivered by the next
+    # hook run / watcher tick through the ordinary changed-title path.
+    archive.remember_clear_label(session_id, title)
+    if title == last_reported(session_id):
+        return False
+    try:
+        import notify  # noqa: PLC0415  (sibling module, lazy like report())
+    except Exception:
+        return False
+    emitted = notify.emit(
+        source="conversation-archiver",
+        source_id=session_id,
+        event="TitleChanged",
+        title=title,
+        body="Session cleared",
+        tmux=notify.tmux_context(),
+    )
+    if emitted:
+        remember(session_id, title)
+    return emitted
+
+
 def _body(session_id: str, resumed: bool) -> str:
     """Inbox-friendly body, consistent with the archive notifications
     ("Turn complete · N turns archived"). Reads the archiver state read-only;
@@ -236,6 +281,12 @@ def report(payload: dict) -> bool:
     # once it appears (Bugbot).
     ensure_watcher(session_id, tpath)
 
+    event = payload.get("hook_event_name", "?")
+    # /clear takes its own path: reset the label to the working directory's
+    # basename and neutralize the carried-over registry name.
+    if event == "SessionStart" and payload.get("source") == "clear":
+        return _report_clear(session_id, payload)
+
     if not tpath.exists():
         return False
 
@@ -246,13 +297,12 @@ def report(payload: dict) -> bool:
     if not title:
         return False
 
-    event = payload.get("hook_event_name", "?")
     # The unconditional heal is for a fresh process looking at a possibly
     # stale consumer: SessionStart source "startup"/"resume" (and, defensive
-    # default, hook payloads too old to carry `source`). SessionStart ALSO
-    # fires for "compact" and "clear" — mid-session events that would
+    # default, hook payloads too old to carry `source`). SessionStart for
+    # "clear" was handled above; "compact" is a mid-session event that would
     # otherwise re-push a misleading "Session resumed" notification on every
-    # compaction; those take the ordinary changed-title path instead.
+    # compaction, so it takes the ordinary changed-title path instead.
     resumed = event == "SessionStart" and payload.get("source", "startup") in (
         "startup",
         "resume",

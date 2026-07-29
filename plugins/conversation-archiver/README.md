@@ -256,6 +256,13 @@ watcher polls cheaply (stat fingerprints, ~1.5s), exits by itself when the
 `claude` process ends, and never double-reports (it shares the hook reporter's
 last-reported state).
 
+`/clear` resets the label to the **working directory's basename** — the new,
+empty conversation should not keep wearing the previous conversation's name.
+Claude Code actually carries an explicit `/rename` name across the clear
+boundary in its process registry; the plugin neutralizes exactly that
+carried-over string (a fresh `/rename` still wins), and the new conversation's
+own first ai-title replaces the directory label once it is generated.
+
 Set `CC_ARCHIVE_NO_NOTIFY=1` to disable these notifications entirely (archiving
 still runs as normal; the watcher is not spawned either).
 
