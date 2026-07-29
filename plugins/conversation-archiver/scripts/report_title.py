@@ -12,10 +12,14 @@ only when that turn ended — for long agentic turns, many minutes later
 This script is the immediacy path. It is registered on SessionStart,
 UserPromptSubmit and PostToolUse (PostToolUse fires after every tool call, so
 an active turn re-checks the title every few seconds) and does the minimum:
-read the hook payload, scan the transcript for the FIRST ai-title (same
-first-wins semantics as archive.session_title — the stale-after-/clear fix),
-and emit a notification when it changed. No git, no archive lock, no repo
-config: the whole run is one transcript scan plus at most one tty write.
+read the hook payload, resolve the display title (a manual /rename from the
+process registry first — archive.user_session_name — else the transcript's
+FIRST ai-title, the first-wins stale-after-/clear fix), and emit a
+notification when it changed. No git, no archive lock, no repo config: the
+whole run is one registry scan + one transcript scan plus at most one tty
+write. Note /rename itself fires no hook — the new name goes out on the next
+PostToolUse / UserPromptSubmit / Stop, i.e. within seconds during an active
+turn.
 
 State: the last REPORTED title lives in its own tiny file
 (state/<sid>.title), deliberately NOT in the archiver's per-session state
@@ -113,7 +117,10 @@ def report(payload: dict) -> bool:
         if tpath is None:
             return False
 
-    title = archive.session_title(tpath)
+    # Explicit /rename outranks the transcript's ai-title (they are separate
+    # channels — see archive.user_session_name). Without this, a manual
+    # rename never reached consumers at all.
+    title = archive.display_title(session_id, tpath)
     if not title:
         return False
 

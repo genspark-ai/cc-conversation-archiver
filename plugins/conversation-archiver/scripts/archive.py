@@ -289,6 +289,72 @@ def parse_transcript(path: Path):
         yield _entry_key(entry, role, text), role, text
 
 
+# Claude Code's per-process session registry. Each running (or exited)
+# process leaves a <pid>.json carrying sessionId, name and nameSource.
+SESSIONS_DIR = HOME / ".claude" / "sessions"
+
+
+def user_session_name(session_id: str) -> str | None:
+    """The EXPLICITLY-set session name from Claude Code's process registry
+    (~/.claude/sessions/<pid>.json), or None.
+
+    `/rename` writes ONLY here — it sets `name` and REMOVES the
+    `nameSource: "derived"` marker; nothing about a manual rename ever
+    reaches the transcript, whose ai-title entries are a separate channel
+    (verified live 2026-07-29: after /rename the registry held the new name
+    while all 180 ai-title stamps kept the old auto title). Conversely the
+    ai-title never flows into the registry. Consumers that want "what the
+    user calls this session" therefore need BOTH sources, explicit name
+    first.
+
+    A name with nameSource "derived" is the automatic directory label
+    ("dir-xx") and must NEVER be surfaced as a display title — that was the
+    original GenTerminal name-sync bug. Multiple registry files can share a
+    session_id (a resumed session leaves the previous process's file
+    behind): prefer a live process, newest updatedAt as the tiebreak. The
+    liveness probe is POSIX-only — on Windows os.kill(pid, 0) TERMINATES
+    the target instead of probing it.
+    """
+    best: tuple[bool, int, str] | None = None
+    try:
+        entries = list(SESSIONS_DIR.glob("*.json"))
+    except Exception:
+        return None
+    for f in entries:
+        try:
+            e = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(e, dict) or e.get("sessionId") != session_id:
+            continue
+        name = (e.get("name") or "").strip()
+        if not name or e.get("nameSource") == "derived":
+            continue
+        alive = False
+        pid = e.get("pid")
+        if os.name == "posix" and isinstance(pid, int) and pid > 0:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except OSError:
+                alive = False
+        updated = e.get("updatedAt")
+        rank = (alive, updated if isinstance(updated, int) else 0, name)
+        if best is None or rank[:2] > best[:2]:
+            best = rank
+    return best[2] if best else None
+
+
+def display_title(session_id: str, transcript_path: Path) -> str | None:
+    """Title to surface to consumers (GenTerminal's Sessions sidebar): the
+    user's explicit name when one exists, else the transcript's ai-title.
+    Once a session has been manually renamed, later ai-title re-stamps no
+    longer override it. The ARCHIVE document keeps using the ai-title
+    (session_title) — the markdown title is a stable content identifier,
+    not a UI label."""
+    return user_session_name(session_id) or session_title(transcript_path)
+
+
 def session_title(path: Path) -> str | None:
     """FIRST ai-title in the transcript, if any (titles are generated lazily).
 
@@ -1935,7 +2001,9 @@ def _archive_locked(session_id: str, tpath: Path, event: str,
         "new_count": new_count,
         "total": len(state["blocks"]),
         "turns": sum(1 for b in state["blocks"] if b.get("role") == "user"),
-        "title": title,
+        # Notification title only — a manual /rename outranks the ai-title
+        # (display_title); the archived document above keeps the ai-title.
+        "title": user_session_name(session_id) or title,
         "file": new_rel,
     }
 
