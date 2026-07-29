@@ -39,11 +39,11 @@ not a CDN pointer like the desktop clients use.
 2. **Run the workflow.** Actions → **CC Archiver Release** → *Run workflow*
    (optionally tick *dry run* first to stage + validate without publishing).
 
-   It mirrors the plugin tree to the public repo's `main` (the plugin's
-   `.claude-plugin/marketplace.json` becomes the repo-root marketplace manifest),
-   tags it `conversation-archiver--v<version>`, and cuts a matching GitHub
-   Release. `tests/`, `__pycache__/`, and `*.pyc` are excluded from the published
-   tree.
+   It runs the plugin test suite, then mirrors the plugin tree to the public
+   repo's `main` (the plugin's `.claude-plugin/marketplace.json` becomes the
+   repo-root marketplace manifest), tags it
+   `conversation-archiver--v<version>`, and cuts a matching GitHub Release.
+   `tests/`, `__pycache__/`, and `*.pyc` are excluded from the published tree.
 
 The workflow **refuses to run if a GitHub Release for
 `conversation-archiver--v<version>` already exists** on the public repo — that's

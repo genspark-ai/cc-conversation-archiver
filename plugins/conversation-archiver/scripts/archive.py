@@ -1056,8 +1056,8 @@ def _redeem_connect_code(sb_connect_url: str) -> tuple:
     """Redeem a one-time connect code for the push target + credential.
 
     ``sb_connect_url`` is the ``…/sources/claude-code/sb-connect/<CODE>``
-    link from the Claude Code connect dialog (the Claude Code tile on the
-    user's Second Brain home). We POST the code to the
+    link from the Claude Code connect dialog (the Claude Code row on the
+    user's Second Brain Sources page). We POST the code to the
     sibling ``/activate`` endpoint on the same origin; the backend consumes
     the code (single-use, 10-min TTL) and answers with the vault push URL
     and a freshly minted push token. Returns ``(remote_url, token)`` or
@@ -1096,8 +1096,8 @@ def _redeem_connect_code(sb_connect_url: str) -> tuple:
             print(
                 "This connect link has expired or was already used (codes "
                 "are single-use and last 10 minutes). Reopen the Connect "
-                "dialog by clicking the Claude Code tile on your Second "
-                "Brain home and paste the fresh message."
+                "dialog by clicking the Claude Code row on your Second "
+                "Brain Sources page and paste the fresh message."
             )
         else:
             print(f"connect failed: backend error {e.code}. Try again in a "
@@ -1137,8 +1137,8 @@ def do_connect(remote_url: str = "", token: str = "",
     (invoked as ``archive.py --connect`` by /conversation-archiver:connect).
 
     Primary path (zero credential): the argument is the ``sb-connect/<code>``
-    link from the Claude Code connect dialog (the Claude Code tile on the
-    user's Second Brain home) — the script redeems the
+    link from the Claude Code connect dialog (the Claude Code row on the
+    user's Second Brain Sources page) — the script redeems the
     one-time code via ``/activate`` and receives the push URL + a freshly
     minted token directly from the backend. Fallbacks, in order: no args +
     a local ``gsk login`` token (self-resolve via ``/resolve``); explicit
@@ -1349,6 +1349,32 @@ _URL_CRED_RE = re.compile(r"(https?://)[^/@\s]+(?::[^@\s]*)?@")
 
 def _mask_url(url: str) -> str:
     return _URL_CRED_RE.sub(r"\1***@", url)
+
+
+def do_status() -> None:
+    """Print a compact, read-only status report without exposing remote secrets."""
+    cfg = load_config()
+    repo = get_repo(cfg)
+    mode = get_mode(cfg)
+
+    print(f"mode: {mode}")
+    print(f"repo: {repo}")
+    if not (repo / ".git").exists():
+        print("remote: none")
+        print("--- recent commits ---")
+        print("(no commits yet)")
+        print("--- pending changes ---")
+        return
+
+    remote = run_git(repo, "remote", "-v", quiet=True)
+    first_remote = remote.stdout.splitlines()[0] if remote.stdout.strip() else "none"
+    print(f"remote: {_mask_url(first_remote)}")
+    print("--- recent commits ---")
+    recent = run_git(repo, "log", "--oneline", "-5", quiet=True)
+    print(recent.stdout.rstrip() or "(no commits yet)")
+    print("--- pending changes ---")
+    pending = run_git(repo, "status", "--short", quiet=True)
+    print("\n".join(pending.stdout.splitlines()[:10]))
 
 
 def do_doctor() -> None:
@@ -1608,6 +1634,9 @@ def main() -> None:
     if "--doctor" in sys.argv:
         do_doctor()
         return
+    if "--status" in sys.argv:
+        do_status()
+        return
     if "--set-repo" in sys.argv:
         args = sys.argv[sys.argv.index("--set-repo") + 1:]
         do_set_repo(args[0] if args else "")
@@ -1702,7 +1731,7 @@ def _maybe_notify(session_id: str, event: str, summary: dict) -> None:
             body = f"Session ended · {turns} {unit} archived"
         else:
             body = f"Turn complete · {turns} {unit} archived"
-        notify.emit(
+        emitted = notify.emit(
             source="conversation-archiver",
             source_id=session_id,
             event=event,
@@ -1710,6 +1739,12 @@ def _maybe_notify(session_id: str, event: str, summary: dict) -> None:
             body=body,
             tmux=notify.tmux_context(),
         )
+        if emitted and summary.get("title"):
+            # Keep the fast-path title reporter (report_title.py) in sync so
+            # it does not re-report the title this notification just carried.
+            import report_title  # sibling module in this scripts/ dir
+
+            report_title.remember(session_id, summary["title"])
     except Exception:
         log("notify failed\n" + traceback.format_exc())
 

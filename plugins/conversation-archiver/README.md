@@ -111,9 +111,9 @@ Mode is stored in `~/.claude/cc-conversation-archiver/config.json`.
 
 ## Second Brain connect
 
-The "Connect Claude Code" dialog (the Claude Code tile on your Second Brain
-home) hands you ONE paste-ready message carrying an `…/sb-connect/<code>`
-link. The code is a
+The "Connect Claude Code" dialog (the Claude Code row on your Second Brain
+Sources page) hands you ONE paste-ready message carrying an
+`…/sb-connect/<code>` link. The code is a
 **one-time, 10-minute** connection code — the script redeems it via the
 backend's `/activate` endpoint and receives the push URL plus a freshly
 minted push credential, so nothing the user copies ever contains a token.

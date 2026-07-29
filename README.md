@@ -84,8 +84,9 @@ remote and auto mode will commit **and** push every turn. Pick whichever fits.
 This is the only option that needs no manual git or credential setup — the
 plugin wires the remote, the credential, and the subfolder for you.
 
-On your Second Brain home, click the **Claude Code** tile → **Connect** and copy
-the one-line message. It contains a one-time link (10-min, single-use). Paste it:
+On your Second Brain **Sources** page, click the **Claude Code** row →
+**Connect** and copy the one-line message. It contains a one-time link (10-min,
+single-use). Paste it:
 
 ```
 /conversation-archiver:connect https://www.genspark.ai/.../sb-connect/<code>

@@ -1,5 +1,5 @@
 {
-  "description": "Archive each conversation turn to a per-session markdown file in a git repo. Triggers on Stop (right after each assistant turn, for low-latency archiving), SubagentStop (an async subagent / background Task finishes — flushes the conversation even when you've stepped away; the archiver redirects the subagent's sidechain transcript to the main session transcript so subagent prompts/replies are never archived), UserPromptSubmit (a backstop that also captures any multi-message reply blocks flushed to the transcript after Stop fired), and SessionEnd (final turn). The archiver is idempotent — blocks are de-duplicated by message uuid — so the overlapping triggers never produce duplicate content. A SessionStart hook checks runtime dependencies (python3 + git). The archive hooks guard on python3 so a missing interpreter is a no-op, never a blocked prompt.",
+  "description": "Archive each conversation turn to a per-session markdown file in a git repo. Triggers on Stop (right after each assistant turn, for low-latency archiving), SubagentStop (an async subagent / background Task finishes — flushes the conversation even when you've stepped away; the archiver redirects the subagent's sidechain transcript to the main session transcript so subagent prompts/replies are never archived), UserPromptSubmit (a backstop that also captures any multi-message reply blocks flushed to the transcript after Stop fired), and SessionEnd (final turn). The archiver is idempotent — blocks are de-duplicated by message uuid — so the overlapping triggers never produce duplicate content. A SessionStart hook checks runtime dependencies (python3 + git). Session-title changes are reported IMMEDIATELY (not only at turn boundaries) by the lightweight report_title.py on SessionStart, UserPromptSubmit and PostToolUse — PostToolUse fires after every tool call, so consumers like GenTerminal's sidebar Sessions section see the ai-title within seconds of Claude generating it mid-turn, instead of when the turn ends. The archive hooks guard on python3 so a missing interpreter is a no-op, never a blocked prompt.",
   "hooks": {
     "SessionStart": [
       {
@@ -7,6 +7,20 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/check_deps.sh\""
+          },
+          {
+            "type": "command",
+            "command": "command -v python3 >/dev/null 2>&1 && python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/report_title.py\" || true"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v python3 >/dev/null 2>&1 && python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/report_title.py\" || true"
           }
         ]
       }
@@ -37,6 +51,10 @@
           {
             "type": "command",
             "command": "command -v python3 >/dev/null 2>&1 && command -v git >/dev/null 2>&1 && python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/archive.py\" || true"
+          },
+          {
+            "type": "command",
+            "command": "command -v python3 >/dev/null 2>&1 && python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/report_title.py\" || true"
           }
         ]
       }

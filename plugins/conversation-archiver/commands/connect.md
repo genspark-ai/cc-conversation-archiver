@@ -1,5 +1,5 @@
 ---
-description: Connect the archiver to your Second Brain. Paste the connect link from the Claude Code tile on your Second Brain home (one-time code; the script redeems it for the push target — no token ever shown). No args falls back to your gsk login credential.
+description: Connect the archiver to your Second Brain. Paste the connect link from the Claude Code row on your Second Brain Sources page (one-time code; the script redeems it for the push target — no token ever shown). No args falls back to your gsk login credential.
 disable-model-invocation: true
 allowed-tools: Bash
 argument-hint: <sb-connect link from the website> (or empty to use gsk login)
