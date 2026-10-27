@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -56,6 +57,8 @@ LOG_PATH = APP_DIR / "archive.log"
 PUSH_LOG = APP_DIR / "push.log"
 PUSH_LOCK = APP_DIR / "push.lock"
 ARCHIVE_LOCK = APP_DIR / "archive.lock"  # serializes concurrent hook runs
+PENDING_DIR = APP_DIR / "pending"  # one queued-run lock per session and kind
+LOG_MAX_BYTES = 16 * 1024 * 1024
 
 DEFAULT_REPO = HOME / "claude-conversations"
 MAX_SLUG_LEN = 60
@@ -77,9 +80,18 @@ SB_RESOLVE_PATH = "/api/memo_v2/sources/claude-code/resolve"
 GSK_CLI_CONFIG = HOME / ".genspark-tool-cli" / "config.json"
 
 
+def _rotate(path: Path) -> None:
+    try:
+        if path.stat().st_size > LOG_MAX_BYTES:
+            path.replace(path.with_name(path.name + ".1"))
+    except OSError:
+        pass
+
+
 def log(msg: str) -> None:
     try:
         APP_DIR.mkdir(parents=True, exist_ok=True)
+        _rotate(LOG_PATH)
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with LOG_PATH.open("a", encoding="utf-8") as fh:
             fh.write(f"[{stamp}] {msg}\n")
@@ -849,17 +861,32 @@ def do_push(repo: Path) -> subprocess.CompletedProcess:
         # rebase somehow can't auto-resolve, abort back to a clean state so we
         # never strand the repo mid-rebase, then let the push below surface the
         # real error for the next turn to retry.
+        #
+        # The fetch runs outside ARCHIVE_LOCK; the rebase runs inside it, and only
+        # when the remote really moved. A `pull --rebase` under the push lock alone
+        # raced the hook commits made under ARCHIVE_LOCK ("fetch updated the
+        # current branch head") and stranded an autostash-only .git/rebase-merge
+        # that blocked every later pull.
         if run_git(repo, "remote").stdout.strip():
-            pull = run_git(repo, "-c", "rebase.autoStash=true",
-                           "pull", "--rebase", "-X", "theirs", timeout=120)
-            if pull.returncode != 0:
-                log(f"pull --rebase rc={pull.returncode}: "
-                    f"{((pull.stderr or '') + (pull.stdout or '')).strip()[:200]}")
-                if (repo / ".git" / "rebase-merge").exists() or \
-                        (repo / ".git" / "rebase-apply").exists():
-                    run_git(repo, "rebase", "--abort")
+            _heal_rebase_state(repo)
+            fetch = run_git(repo, "fetch", "--quiet", timeout=120)
+            if fetch.returncode != 0:
+                log(f"fetch rc={fetch.returncode}: {(fetch.stderr or '').strip()[:200]}")
+            elif run_git(repo, "merge-base", "--is-ancestor", "@{u}", "HEAD").returncode == 1:
+                with open(ARCHIVE_LOCK, "w") as lockf:
+                    fcntl.flock(lockf, fcntl.LOCK_EX)
+                    reb = run_git(repo, "-c", "rebase.autoStash=true",
+                                  "rebase", "-X", "theirs", "@{u}", timeout=120)
+                    if reb.returncode != 0:
+                        log(f"rebase rc={reb.returncode}: "
+                            f"{((reb.stderr or '') + (reb.stdout or '')).strip()[:200]}")
+                        if (repo / ".git" / "rebase-merge").exists() or \
+                                (repo / ".git" / "rebase-apply").exists():
+                            run_git(repo, "rebase", "--abort")
+                        _heal_rebase_state(repo)
         res = run_git(repo, "push", timeout=120)
     out = ((res.stdout or "") + (res.stderr or "")).strip()
+    _rotate(PUSH_LOG)
     try:
         with PUSH_LOG.open("a", encoding="utf-8") as fh:
             fh.write(out + "\n")
@@ -868,6 +895,23 @@ def do_push(repo: Path) -> subprocess.CompletedProcess:
     if res.returncode != 0:
         log(f"push rc={res.returncode}")
     return res
+
+
+def _heal_rebase_state(repo: Path) -> None:
+    """Drop rebase state git can neither continue nor abort: a directory with no
+    head-name (left holding only an autostash). Rebases here only ever run under
+    PUSH_LOCK, which the caller holds, so none is genuinely in progress. The
+    autostash commit stays reachable under refs/archiver/."""
+    for name in ("rebase-merge", "rebase-apply"):
+        d = repo / ".git" / name
+        if not d.is_dir() or (d / "head-name").exists():
+            continue
+        stash = d / "autostash"
+        if stash.exists():
+            sha = stash.read_text(encoding="utf-8").strip()
+            run_git(repo, "update-ref", f"refs/archiver/autostash-{int(time.time())}", sha)
+        shutil.rmtree(d, ignore_errors=True)
+        log(f"removed orphaned .git/{name} (no head-name)")
 
 
 def push_background(repo: Path) -> None:
@@ -1814,6 +1858,14 @@ def main() -> None:
 
     if not session_id or not transcript_path:
         return
+
+    # Hook runs hand the work to a detached child and return at once. Every
+    # session's runs serialize on ARCHIVE_LOCK and re-read whole transcripts, so
+    # under load a prompt queued behind them outlived Claude Code's 30 s
+    # UserPromptSubmit timeout. CC_ARCHIVE_SYNC=1 keeps a run in the foreground.
+    if "--detached" not in sys.argv and not os.environ.get("CC_ARCHIVE_SYNC"):
+        spawn_detached(raw, event)
+        return
     tpath = Path(transcript_path)
     if not tpath.exists():
         return
@@ -1850,10 +1902,23 @@ def main() -> None:
     # the one git repo, so without a lock two runs could pick the same filename,
     # overwrite each other's markdown, and corrupt the index. The flock releases
     # when the fd closes at the end of the with-block.
+    #
+    # At most one run per session (and per kind: Stop/SessionEnd notify, the rest
+    # don't) waits for the lock. A later run that finds one already waiting exits:
+    # the waiter reads the transcript only after it gets the lock, so it archives
+    # this run's content too.
     APP_DIR.mkdir(parents=True, exist_ok=True)
-    with open(ARCHIVE_LOCK, "w") as lockf:
-        fcntl.flock(lockf, fcntl.LOCK_EX)
-        summary = _archive_locked(session_id, tpath, event)
+    PENDING_DIR.mkdir(parents=True, exist_ok=True)
+    kind = "notify" if event in ("Stop", "SessionEnd") else "quiet"
+    with open(PENDING_DIR / f"{session_id}.{kind}", "w") as pendf:
+        try:
+            fcntl.flock(pendf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        with open(ARCHIVE_LOCK, "w") as lockf:
+            fcntl.flock(lockf, fcntl.LOCK_EX)
+            fcntl.flock(pendf, fcntl.LOCK_UN)
+            summary = _archive_locked(session_id, tpath, event)
 
     # Surface a GenTerminal inbox notification when a turn finishes (Stop) or the
     # session ends. Other events (UserPromptSubmit / SubagentStop) still archive
@@ -1861,6 +1926,32 @@ def main() -> None:
     # write never holds up another session's archive. Best-effort throughout.
     if summary is not None and event in ("Stop", "SessionEnd"):
         _maybe_notify(session_id, event, summary)
+
+
+def spawn_detached(raw: str, event: str) -> None:
+    """Re-run this script with --detached in its own session, feeding it the hook
+    payload. Output goes to /dev/null so Claude Code's hook pipe closes as soon as
+    this parent exits. The notification tty is resolved here, while the hook's
+    ancestor processes still lead to it; the reparented child can't find it."""
+    env = dict(os.environ)
+    if event in ("Stop", "SessionEnd") and not env.get("CC_ARCHIVE_NO_NOTIFY"):
+        try:
+            import notify  # sibling module in this scripts/ dir
+            tty = notify._target_tty()
+            if tty:
+                env["CC_ARCHIVE_TTY"] = tty
+        except Exception:
+            pass
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--detached"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True, env=env,
+        )
+        proc.stdin.write(raw.encode("utf-8"))
+        proc.stdin.close()
+    except Exception as exc:
+        log(f"detach failed: {exc}")
 
 
 def _maybe_notify(session_id: str, event: str, summary: dict) -> None:
@@ -1890,6 +1981,7 @@ def _maybe_notify(session_id: str, event: str, summary: dict) -> None:
             title=title,
             body=body,
             tmux=notify.tmux_context(),
+            target_tty=os.environ.get("CC_ARCHIVE_TTY"),
         )
         if emitted and summary.get("title"):
             # Keep the fast-path title reporter (report_title.py) in sync so
